@@ -18,6 +18,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.dry import DryState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logits_processor.interface import (
@@ -63,12 +64,16 @@ class Sampler:
         self.penalties_state = PenaltiesState(vllm_config, lp_req_state)
         logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
         bad_words_state = BadWordsState(vllm_config, lp_req_state)
+        self.dry_state = DryState(vllm_config, lp_req_state)
 
         # List order is pipeline order: bias adds, penalties scale, so the
-        # two do not commute.
+        # two do not commute. DRY follows the penalties for the same reason
+        # it does in llama.cpp's sampler chain, and precedes the bad-words
+        # mask, which it cannot undo because it only subtracts.
         self.logits_processors: list[LogitsProcessor] = [
             logit_bias_state,
             self.penalties_state,
+            self.dry_state,
             bad_words_state,
             *custom_logits_processors,
         ]
