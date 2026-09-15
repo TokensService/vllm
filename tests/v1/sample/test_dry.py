@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.sample.dry_core as dry_core_mod
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.dry_core import _dry_penalties
@@ -296,15 +297,15 @@ def _make_v2_state(max_num_reqs=8, vocab=32, max_model_len=256, device=DEVICE):
 def _apply(state, logits, idx_mapping_np, seq_lens_np, *, expanded_logits=None):
     """Drive ``DryState.apply`` through a LogitsContext, as the sampler does.
 
-    DRY reads ``idx_mapping_np`` and ``pos`` and infers draft expansion from the
-    row count, so ``expanded_logits`` is not an argument. Passing it here asserts
-    the shapes say what the test intends.
+    DRY reads ``idx_mapping_np`` and ``seq_lens_upper_bound_np`` and infers
+    draft expansion from the row count, so ``expanded_logits`` is no longer an
+    argument. Passing it here asserts the shapes say what the test intends.
 
     Args:
       state: the ``DryState`` under test.
       logits: [rows, vocab] tensor, modified in place.
       idx_mapping_np: [num_reqs] batch position -> request slot.
-      seq_lens_np: [num_reqs] host-side context lengths; ``ctx.pos`` is one less.
+      seq_lens_np: [num_reqs] host-side context lengths.
       expanded_logits: optional expected value of the draft-expansion check.
 
     """
@@ -402,10 +403,19 @@ def test_v2_spec_decode_skipped_with_warning():
     assert state._warned_spec_decode
 
 
-def test_v2_matches_reference_fuzz():
+@pytest.mark.parametrize("chunk_budget", [4096, dry_core_mod._CHUNK_BYTE_BUDGET])
+def test_v2_matches_reference_fuzz(chunk_budget, monkeypatch):
     # The V2 window-gather + routing path must agree with the sequential
     # reference on randomized histories, including degenerate bases that
     # route through the slow path.
+    #
+    # PARAMETRIZED OVER THE CHUNK BUDGET because a single chunk cannot see any defect in
+    # how per-chunk results are combined, and at this test's sizes the default budget is
+    # always a single chunk. Counted over the 56 dry_core calls a full run makes: at the
+    # default, 56 of 56 run one chunk; at 4096 B, 46 of 56 run more than one, from 2 up
+    # to 175. The 10 that still run one are trials whose windows all came out short, and
+    # they are the reason this is parametrized rather than switched.
+    monkeypatch.setattr(dry_core_mod, "_CHUNK_BYTE_BUDGET", chunk_budget)
     state, all_tokens = _make_v2_state(max_num_reqs=8, vocab=16, max_model_len=200)
     rng = random.Random(7)
     for trial in range(60):
@@ -559,8 +569,18 @@ def test_breaker_resolution_covers_added_tokens():
     assert resolve_dry_breakers(tok, ("\n",)) == [1]
 
 
+# THREE CASES, because one ceiling cannot bound three different terms. The penalty
+# accumulator scales with R and the chunk transients do not, so a bound taken at one
+# batch size cannot tell those apart; and the breaker path allocates a stacked
+# [R, vocab] bool that the breakerless cases have the slack to hide. The dense
+# formulation these discriminate against measured 41.1 B per entry on the revision that
+# had it, which is 1.26 GiB at R=256.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_peak_memory_bounded():
+@pytest.mark.parametrize(
+    ("n_reqs", "limit_mib", "n_breakers"),
+    [(32, 128, 0), (256, 256, 0), (256, 320, 3900)],
+)
+def test_peak_memory_bounded(n_reqs, limit_mib, n_breakers):
     # base=1.1 gives max_exponent=930, a large J for the vectorized path
     # (the cap is allowed_length + max_exponent <= _J_BUDGET = 2048).
     # The chunk budget is denominated in bytes and the gather is int32,
@@ -569,7 +589,7 @@ def test_peak_memory_bounded():
     # gather allocated ~8x more and OOMed 8 GB GPUs.
     device = torch.device("cuda")
     rng = random.Random(3)
-    n_reqs, window = 32, 2048
+    window = 2048
     state, all_tokens = _make_v2_state(
         max_num_reqs=n_reqs, vocab=128256, max_model_len=window, device=device
     )
@@ -579,12 +599,23 @@ def test_peak_memory_bounded():
         dry_allowed_length=2,
         dry_sequence_breakers=[],
     )
+    if n_breakers:
+        # THE BREAKER PATH NEEDS ITS OWN BOUND: it allocates per-request masks and one
+        # stacked [R, vocab] bool a step, and the breakerless cases above have enough
+        # slack to hide that. 3900 ids is roughly what llama.cpp's default set resolves
+        # to on a Llama-3 tokenizer, so this is the shape almost every real request has.
+        # ONE OF THEM IS INSIDE THE HISTORY'S ALPHABET, deliberately. A set drawn wholly
+        # from outside it never matches, rep_limit stays n_r, and only the allocation is
+        # under test; drawn wholly from inside it, every window token is a breaker,
+        # rep_limit collapses under allowed_length and nothing charges at all. One id
+        # inside puts the charge count between the two: 1279 against 2013 without.
+        ids = {0} | set(rng.sample(range(8, 128256), n_breakers - 1))
+        params._dry_breaker_ids = sorted(ids)
     # A SMALL ALPHABET, deliberately. With randrange(1000) over 2048 positions a 2-token
-    # repeat essentially never occurs, so nothing is ever charged, dry_core returns at
-    # its ``if not charged`` guard, and this test measured only the match scan - never
-    # the penalty application it exists to bound. Eight symbols guarantee charges, and
-    # the assertion below fails if that ever stops being true rather than passing
-    # vacuously again.
+    # repeat essentially never occurs, so the scatter writes nothing but the trash slot
+    # and the breaker and exponent arithmetic is never exercised at width. Eight symbols
+    # guarantee charges, and the assertion below fails if that ever stops being true
+    # rather than passing vacuously.
     hist = torch.tensor(
         [[rng.randrange(8) for _ in range(window)] for _ in range(n_reqs)],
         dtype=torch.int32,
@@ -605,21 +636,27 @@ def test_peak_memory_bounded():
     )
     torch.accelerator.synchronize()
     peak = torch.accelerator.max_memory_allocated() - base_alloc
-    # The penalty path must actually have run, or the bound below is measuring the scan
-    # alone.
+    # The penalty path must actually have charged something, or this bounds a run that
+    # never exercised the arithmetic it exists to bound.
     charged = int((logits < 0).sum().item())
     assert charged > 0, (
         "no token was penalized, so this test did not reach the penalty path"
     )
-    # A ceiling chosen to DISCRIMINATE, which two earlier versions did not. The
-    # original was 2 * _CHUNK_BYTE_BUDGET (512 MiB); the second was 320 MiB,
-    # picked against the old dense peak of 165 MiB and therefore still passing
-    # the very regression it was tightened to catch. Measured on this
-    # configuration: 76.2 MiB with the sparse penalty path (bit-stable across
-    # runs), 165.3 MiB with the dense [R, vocab] formulation it replaced. 128
-    # MiB sits above the first with 1.7x headroom and below the second, so a
-    # return to dense fails here.
-    limit = 128 * 1024 * 1024
+    # Ceilings chosen to DISCRIMINATE, which two earlier versions did not. The original
+    # was 2 * _CHUNK_BYTE_BUDGET (512 MiB); the second was 320 MiB, picked against a
+    # measured peak of 165 MiB and therefore still passing the very regression it was
+    # tightened to catch. Measured here at dry_base=1.1 (J=932), bit-stable across runs:
+    # 84.6 MiB at R=32, 200.6 at R=256, 264.3 at R=256 with breakers. The formulation
+    # these bound carries the exponent, its float64 cast, the pow result and the product
+    # at full [R, vocab] width instead of inside the chunk loop. It is not hypothetical:
+    # it is the first version of dry_core.py, added by "[Sampler] Add the DRY match
+    # computation", and the same measurement there gives 41.1 B per entry, 167.6 MiB at
+    # R=32 and 1287 at R=256 (at dry_base=1.75). So every ceiling here sits above what
+    # this costs and below what that did.
+    # WHAT THESE DO NOT CATCH: anything smaller than the slack, which is 43 MiB at R=32,
+    # 55 at R=256 and 56 at R=256 with breakers. A second [R, vocab] bool (31 MiB at
+    # R=256) fits inside all three; a [R, vocab] float32 (125 MiB) does not.
+    limit = limit_mib * 1024 * 1024
     assert peak < limit, f"peak {peak / 2**20:.1f} MiB over {limit / 2**20:.0f} MiB"
 
 
@@ -816,3 +853,53 @@ def test_dry_base_below_one_warns_that_it_disabled_dry():
         params = SamplingParams(dry_multiplier=0.8, dry_base=1.75)
     assert use_dry(params)
     assert not log.warning.called
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_result_does_not_depend_on_the_chunk_budget():
+    """The same input must give the same logits however the offsets are chunked.
+
+    The match scan walks token offsets in chunks sized against a byte budget, so
+    the number of chunks varies with batch size and window length. An earlier
+    revision accumulated match lengths and applied penalties in a second pass
+    over those same chunks, which subtracted a token's penalty once per chunk it
+    appeared in: the same request scored differently at different batch sizes,
+    and every test here was small enough to fit one chunk and miss it.
+    """
+    from vllm.v1.sample import dry_core as dc
+
+    device = torch.device("cuda")
+    vocab, window, n_reqs = 64, 600, 1
+    # A short alphabet repeated, so one follower token recurs at offsets far
+    # enough apart to land in different chunks.
+    W = torch.tensor([([5, 6, 7] * 200)[:window]], dtype=torch.int64, device=device)
+    col = lambda v, dt=torch.int64: torch.full((n_reqs,), v, dtype=dt, device=device)  # noqa: E731
+
+    def run(budget):
+        saved = dc._CHUNK_BYTE_BUDGET
+        dc._CHUNK_BYTE_BUDGET = budget
+        try:
+            logits = torch.zeros(n_reqs, vocab, device=device)
+            dc.dry_core(
+                logits,
+                torch.arange(n_reqs, device=device),
+                W,
+                col(window),
+                col(2),
+                col(60),
+                col(0.8, torch.float32),
+                col(1.75, torch.float32),
+                [None] * n_reqs,
+                j_budget=62,
+            )
+            return logits
+        finally:
+            dc._CHUNK_BYTE_BUDGET = saved
+
+    many = run(4096)
+    one = run(1 << 30)
+    assert torch.equal(many, one), (
+        f"chunking changed the result: {many[0][many[0] < 0][:3].tolist()} vs "
+        f"{one[0][one[0] < 0][:3].tolist()}"
+    )
+    assert (many < 0).any(), "nothing was penalized, so this test proves nothing"
