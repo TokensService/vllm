@@ -232,7 +232,7 @@ class TestCSALinearGrouping:
     def test_every_group_fits_one_packed_block(self):
         config = _shared_layout_config()
         groups = _default_builder.get_kv_cache_groups(config, _make_csa_linear_specs())
-        bytes_per_block = _default_builder._get_kv_cache_bytes_per_block(groups)
+        bytes_per_block = _default_builder.get_pool_bytes_per_block(config, groups)
 
         pages = _pages(groups)
         for group in groups:
@@ -396,7 +396,7 @@ class TestCSALinearGrouping:
         groups = _get_packed_kv_cache_groups(config, specs)
         gdn = [g for g in groups if g.layer_names[0].startswith("gdn.")]
 
-        assert _default_builder._get_kv_cache_bytes_per_block(groups) == sum(
+        assert _default_builder.get_pool_bytes_per_block(config, groups) == sum(
             specs[name].page_size_bytes for name in specs if name.startswith("wide.")
         )
         # That block holds every GDN state at once, so the repeat pattern alone
@@ -443,7 +443,7 @@ class TestSlidingWindowBucketCap:
         pages = _pages(groups)
         main = next(g for g in groups if "layers.2.attn" in g.layer_names)
         main_bytes = sum(pages[n] for n in main.layer_names)
-        assert _default_builder._get_kv_cache_bytes_per_block(groups) == main_bytes
+        assert _default_builder.get_pool_bytes_per_block(config, groups) == main_bytes
         swa_groups = [g for g in groups if g.layer_names[0].endswith(".swa")]
         per_group = main_bytes // pages["layers.0.swa"]
         assert len(swa_groups) == -(-43 // per_group)
@@ -457,8 +457,8 @@ class TestSlidingWindowBucketCap:
 class TestDensePacking:
     def test_bytes_per_block_is_largest_group(self):
         groups, g1, g2 = _mixed_page_groups()
-        assert _default_builder._get_kv_cache_bytes_per_block(
-            groups
+        assert _default_builder.get_pool_bytes_per_block(
+            _mock_vllm_config("BLHNC"), groups
         ) == _expected_bytes_per_block(groups)
 
         config = _default_builder.get_kv_cache_config_from_groups(
@@ -540,8 +540,8 @@ class TestDensePacking:
             _mock_vllm_config("BLNHC"), groups, MEMORY
         )
         assert config.num_blocks == MEMORY // _expected_bytes_per_block(groups)
-        assert _default_builder._pool_bytes_per_block(
-            groups
+        assert _default_builder.get_pool_bytes_per_block(
+            _mock_vllm_config("BLNHC"), groups
         ) == _expected_bytes_per_block(groups)
 
         views = _bind(config, "BLNHC")
@@ -656,7 +656,7 @@ class TestCompressorRingGroup:
             config,
             groups,
             available_memory=64
-            * _default_builder._get_kv_cache_bytes_per_block(groups),
+            * _default_builder.get_pool_bytes_per_block(config, groups),
         )
         assert resolve_kv_cache_block_sizes(kv_cache_config, config) == (128, 64)
         manager = KVCacheManager(
@@ -697,15 +697,18 @@ class TestSWABoundedReplayGrouping:
         for layer in range(4):
             specs[f"layers.{layer}.attn.swa_cache"] = swa
 
-        groups = get_kv_cache_groups(config, specs)
+        groups = _default_builder.get_kv_cache_groups(config, specs)
         # The worker reads the replay window off the (packed) group specs to
         # arm the window clamp; the wrapper must forward it like cacheability.
         assert sorted(
             (g.kv_cache_spec.prefix_cacheable, g.kv_cache_spec.prefix_replay_tokens)
             for g in groups
         ) == [(False, 128)] * 4 + [(True, 0)]
-        kv_cache_config = get_kv_cache_config_from_groups(
-            config, groups, available_memory=64 * _get_kv_cache_bytes_per_block(groups)
+        kv_cache_config = _default_builder.get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=64
+            * _default_builder.get_pool_bytes_per_block(config, groups),
         )
         manager = KVCacheManager(
             generate_scheduler_kv_cache_config([kv_cache_config]),
