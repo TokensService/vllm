@@ -277,7 +277,13 @@ def test_double_pow_saturation():
 # ---------------------------------------------------------------------------
 
 
-def _make_v2_state(max_num_reqs=8, vocab=32, max_model_len=256, device=DEVICE):
+def _make_v2_state(
+    max_num_reqs=8,
+    vocab=32,
+    max_model_len=256,
+    device=DEVICE,
+    speculative_config=None,
+):
     from vllm.v1.worker.gpu.sample.dry import DryState
 
     all_tokens = torch.zeros(
@@ -289,9 +295,9 @@ def _make_v2_state(max_num_reqs=8, vocab=32, max_model_len=256, device=DEVICE):
         device=device,
         all_token_ids=SimpleNamespace(gpu=all_tokens),
     )
-    # DryState takes the VllmConfig for LogitsProcessor conformance and does
-    # not read it.
-    return DryState(None, req_states), all_tokens
+    # ``speculative_config`` is the only field DryState reads off the VllmConfig.
+    vllm_config = SimpleNamespace(speculative_config=speculative_config)
+    return DryState(vllm_config, req_states), all_tokens
 
 
 def _apply(state, logits, idx_mapping_np, seq_lens_np, *, expanded_logits=None):
@@ -401,6 +407,29 @@ def test_v2_spec_decode_skipped_with_warning():
     _apply(state, logits, np.array([0]), np.array([8]), expanded_logits=True)
     assert (logits == 0).all()
     assert state._warned_spec_decode
+
+
+def test_v2_spec_decode_config_skips_unexpanded_batch():
+    # The case the shape check cannot see: a speculative engine on a step where
+    # no request carries drafts, so the batch is one row per request and looks
+    # exactly like an ordinary decode. The config-keyed gate has to catch it.
+    state, all_tokens = _make_v2_state(speculative_config=SimpleNamespace())
+    state.add_request(0, SamplingParams(dry_multiplier=0.8, dry_sequence_breakers=[]))
+    all_tokens[0, :8] = 7
+    logits = torch.zeros(1, 32, device=DEVICE)
+    _apply(state, logits, np.array([0]), np.array([8]), expanded_logits=False)
+    assert (logits == 0).all()
+    assert state._warned_spec_decode
+
+    # The same batch without a speculative config is penalized, which is what
+    # makes the skip above attributable to the config and not to the window.
+    ref, ref_tokens = _make_v2_state()
+    ref.add_request(0, SamplingParams(dry_multiplier=0.8, dry_sequence_breakers=[]))
+    ref_tokens[0, :8] = 7
+    ref_logits = torch.zeros(1, 32, device=DEVICE)
+    _apply(ref, ref_logits, np.array([0]), np.array([8]), expanded_logits=False)
+    assert ref_logits[0, 7].item() < 0
+    assert not ref._warned_spec_decode
 
 
 @pytest.mark.parametrize("chunk_budget", [4096, dry_core_mod._CHUNK_BYTE_BUDGET])
@@ -814,13 +843,14 @@ def test_dry_int_params_reject_values_that_would_kill_the_worker(field):
 
 
 def test_dry_rejected_under_speculative_decoding():
-    """DRY must be refused with a speculative config, not skipped in the sampler.
+    """DRY must be refused with a speculative config, not left to the sampler.
 
-    The sampler's skip triggers on draft-expanded logits, which is false on any
-    step where no request carries draft tokens - the step that finishes a
-    prefill, among others. A request allowed through would therefore get DRY on
-    some steps and not others, flickering with the schedule. Refusing is the
-    honest behaviour and matches how min_p and logit_bias are handled.
+    The sampler does skip it consistently, on a gate keyed to the engine's
+    speculative config rather than on the batch shape, which
+    test_v2_spec_decode_config_skips_unexpanded_batch pins. But a skip is silent:
+    the request is accepted and no penalty is ever applied, so the caller learns
+    nothing. Refusing is the honest behaviour and matches how min_p and
+    logit_bias are handled.
     """
     spec = SimpleNamespace()  # only `is None` is tested by the validator
     with pytest.raises(VLLMValidationError, match="speculative"):

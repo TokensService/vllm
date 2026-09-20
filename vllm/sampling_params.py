@@ -1189,12 +1189,15 @@ class SamplingParams(
                 "The min_p and logit_bias sampling parameters "
                 "are not yet supported with speculative decoding."
             )
-        # DRY, likewise, and it must be refused here rather than skipped in the sampler.
-        # The sampler's skip is keyed on the logits being draft-expanded, which is false
-        # on any step where no request happens to carry draft tokens - the step that
-        # finishes a prefill, for one - so a request left to run would get DRY applied
-        # on some steps and not others, flickering with the schedule.
-        # Silently-intermittent penalties are worse than a refusal.
+        # DRY, likewise, and it must be refused here rather than left to the sampler.
+        # DryState.apply would skip it consistently - it gates on the engine's
+        # speculative config, which holds on every step - but a skip is silent: the
+        # request is accepted and no penalty is ever applied, so the caller learns
+        # nothing. Refusing tells them the feature is unsupported.
+        # The sampler's other gate, the draft-expanded row count, is false on any step
+        # where no request happens to carry draft tokens - the step that finishes a
+        # prefill, for one - so before the config gate a request left to run got DRY on
+        # some steps and not others. That is history, not the reason to refuse.
         # Gated on the multiplier alone, deliberately, rather than on the full
         # use_dry() predicate (which also wants dry_base >= 1.0 and
         # dry_penalty_last_n != 0). A request that asked for DRY and then

@@ -40,7 +40,9 @@ def _make_sampler(custom_logits_processors: Sequence[LogitsProcessor] = ()) -> S
         device=DEVICE,
     )
     return Sampler(
-        vllm_config=SimpleNamespace(reasoning_config=MockReasoningConfig()),
+        vllm_config=SimpleNamespace(
+            reasoning_config=MockReasoningConfig(), speculative_config=None
+        ),
         max_num_reqs=4,
         vocab_size=VOCAB_SIZE,
         device=DEVICE,

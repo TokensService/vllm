@@ -64,16 +64,19 @@ class Sampler:
         self.penalties_state = PenaltiesState(vllm_config, lp_req_state)
         logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
         bad_words_state = BadWordsState(vllm_config, lp_req_state)
-        self.dry_state = DryState(vllm_config, lp_req_state)
+        dry_state = DryState(vllm_config, lp_req_state)
 
         # List order is pipeline order: bias adds, penalties scale, so the
         # two do not commute. DRY follows the penalties for the same reason
         # it does in llama.cpp's sampler chain, and precedes the bad-words
-        # mask, which it cannot undo because it only subtracts.
+        # mask, so that mask wins over its edits. It only subtracts, so it
+        # cannot re-inflate the grammar mask the model runner applies before
+        # the sampler, the property LogitsProcessor.apply() is required to
+        # respect.
         self.logits_processors: list[LogitsProcessor] = [
             logit_bias_state,
             self.penalties_state,
-            self.dry_state,
+            dry_state,
             bad_words_state,
             *custom_logits_processors,
         ]

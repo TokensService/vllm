@@ -9,12 +9,12 @@
 GPU-resident ``req_states.all_token_ids``, so no per-step host-to-device
 copy of token history is needed.
 
-Speculative decoding is not supported. Requests enabling DRY are refused
-up front by ``SamplingParams._validate_spec_decode``; the expanded-logits
-branch below is a defensive backstop and should be unreachable on normal
-paths. It cannot be the primary gate, because it keys on the logits being
-draft-expanded, which is false on any step where no request happens to
-carry draft tokens - so relying on it applied DRY intermittently.
+Speculative decoding is not supported. Requests enabling DRY are refused up
+front by ``SamplingParams._validate_spec_decode``; ``apply`` backstops that
+gate twice, on the engine's speculative config and on draft-expanded logits,
+and skips the penalty with a one-time warning if either holds. Only the
+config check covers every step: the shape check is false on any step where no
+request happens to carry draft tokens, so alone it applied DRY intermittently.
 """
 
 import numpy as np
@@ -39,6 +39,10 @@ logger = init_logger(__name__)
 class DryState(LogitsProcessor):
     def __init__(self, vllm_config: VllmConfig, req_states: LogitsProcRequestState):
         self.req_states = req_states
+        # Half the spec-decode backstop, and the half that holds on every step;
+        # the other half, the draft-expanded row count apply() checks, is true
+        # only on the steps that actually carry drafts.
+        self._spec_decode = vllm_config.speculative_config is not None
         max_num_reqs = req_states.max_num_reqs
         self.vocab_size = req_states.vocab_size
         self.device = req_states.device
@@ -125,8 +129,9 @@ class DryState(LogitsProcessor):
         if active_rows.size == 0:
             return logits
         # A request owns one logits row per draft token under speculative
-        # decoding, so more rows than requests means drafts are in play.
-        if logits.shape[0] != idx_mapping_np.shape[0]:
+        # decoding, so more rows than requests means drafts are in play. The
+        # config says so on every step, including the ones that carry none.
+        if self._spec_decode or logits.shape[0] != idx_mapping_np.shape[0]:
             if not self._warned_spec_decode:
                 logger.warning(
                     "DRY is not applied with speculative decoding yet; "
