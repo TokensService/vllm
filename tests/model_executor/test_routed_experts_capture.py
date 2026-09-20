@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -270,11 +271,132 @@ def test_routed_experts_capturer_single_dp_no_metadata():
     """dp_metadata is None: capture writes the full topk_ids rows."""
     capturer = _capturer_with_buffer(dp_rank=0)
     topk = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
-    ctx = SimpleNamespace(dp_metadata=None)
+    ctx = SimpleNamespace(dp_metadata=None, additional_kwargs={})
     with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert torch.equal(capturer.device_buffer[:3, 0, :], topk)
     assert capturer.device_buffer[3, 0, 0].item() == -1
+
+
+def test_routed_experts_capturer_honors_microbatch_offset():
+    capturer = _capturer_with_buffer(dp_rank=0)
+    topk = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    ctx = SimpleNamespace(
+        dp_metadata=None,
+        additional_kwargs={"routed_experts_token_offset": 4},
+    )
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(layer_id=0, topk_ids=topk)
+    assert torch.equal(capturer.device_buffer[4:7, 0, :], topk)
+    assert (capturer.device_buffer[:4, 0, :] == -1).all()
+
+
+def test_routed_experts_snapshot_compacts_staged_rows():
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=1)
+    capturer.attn_gid = 0
+    capturer.device_buffer.copy_(torch.arange(16).reshape(8, 1, 2))
+    slots = torch.arange(8).reshape(1, 8)
+    rows = torch.tensor([0, 1, 4, 5])
+    result = capturer.get_routed_experts(slots, 4, rows)
+    expected_routing = capturer.device_buffer[rows].clone()
+    torch.testing.assert_close(result.routing_data, expected_routing)
+    torch.testing.assert_close(result.slot_mapping, slots[0, :4])
+    capturer.device_buffer.fill_(-1)
+    torch.testing.assert_close(result.routing_data, expected_routing)
+
+
+def test_routed_staging_end_to_end_preserves_logical_token_mapping():
+    """Diagnose the complete logical -> physical -> logical row mapping."""
+    from vllm.v1.worker.gpu.ubatch_utils import (
+        compact_staged_rows,
+        restore_staged_inputs,
+        stage_decode_tokens,
+    )
+    from vllm.v1.worker.ubatch_utils import UBatchSlice
+
+    num_tokens = 63
+    padded = 128
+    logical_ids = torch.arange(num_tokens, dtype=torch.int32) + 1000
+    logical_positions = torch.arange(num_tokens, dtype=torch.int64) + 2000
+    logical_blocks = torch.arange(num_tokens * 2, dtype=torch.int32).reshape(
+        num_tokens, 2
+    )
+    logical_slots = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0) + 3000
+    batch = SimpleNamespace(
+        num_tokens=num_tokens,
+        num_tokens_after_padding=padded,
+        num_reqs=num_tokens,
+        has_prefill=False,
+        num_draft_tokens=0,
+        num_scheduled_tokens=np.ones(num_tokens, dtype=np.int32),
+        input_ids=torch.cat(
+            (
+                logical_ids,
+                torch.full((padded - num_tokens,), -1, dtype=logical_ids.dtype),
+            )
+        ),
+        positions=torch.cat(
+            (logical_positions, torch.full((padded - num_tokens,), -1))
+        ),
+        is_padding=torch.zeros(padded, dtype=torch.bool),
+    )
+    blocks = torch.cat(
+        (
+            logical_blocks,
+            torch.full((padded - num_tokens, 2), -1, dtype=logical_blocks.dtype),
+        ),
+        dim=0,
+    )
+    slots = torch.cat((logical_slots, torch.full((1, padded - num_tokens), -1)), dim=1)
+    slices = [
+        UBatchSlice(slice(0, 64), slice(0, 64)),
+        UBatchSlice(slice(64, 128), slice(64, 128)),
+    ]
+
+    rows = stage_decode_tokens(batch, (blocks,), slots, slices)
+    assert rows.tolist() == [*range(32), *range(64, 95)]
+    torch.testing.assert_close(batch.input_ids[rows], logical_ids)
+
+    capturer = _capturer_with_buffer(max_tokens=padded, num_layers=1)
+    capturer.attn_gid = 0
+    expected_routes = torch.stack(
+        (logical_ids.remainder(17), logical_positions.to(torch.int32).remainder(19)),
+        dim=1,
+    )
+    for microbatch in slices:
+        token_slice = microbatch.token_slice
+        physical_routes = torch.stack(
+            (
+                batch.input_ids[token_slice].remainder(17),
+                batch.positions[token_slice].to(torch.int32).remainder(19),
+            ),
+            dim=1,
+        )
+        ctx = SimpleNamespace(
+            dp_metadata=None,
+            additional_kwargs={
+                "routed_experts_token_offset": token_slice.start,
+            },
+        )
+        with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+            capturer.capture(layer_id=0, topk_ids=physical_routes)
+
+    physical_output = (
+        batch.input_ids.to(torch.int64) * 10 + batch.positions
+    ).unsqueeze(1)
+    compact_staged_rows(physical_output, rows)
+    restore_staged_inputs(batch, (blocks,), slots, rows)
+    routed = capturer.get_routed_experts(slots, num_tokens, rows)
+
+    torch.testing.assert_close(
+        physical_output[:num_tokens, 0],
+        logical_ids.to(torch.int64) * 10 + logical_positions,
+    )
+    torch.testing.assert_close(routed.routing_data[:, 0, :], expected_routes)
+    torch.testing.assert_close(routed.slot_mapping, logical_slots[0])
+    torch.testing.assert_close(batch.input_ids[:num_tokens], logical_ids)
+    torch.testing.assert_close(batch.positions[:num_tokens], logical_positions)
+    torch.testing.assert_close(blocks[:num_tokens], logical_blocks)
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
@@ -282,7 +404,8 @@ def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
     capturer = _capturer_with_buffer(dp_rank=1)
     num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp),
+        additional_kwargs={},
     )
     # Concatenated order: rank0 rows then rank1 rows.
     topk = torch.tensor(
@@ -299,7 +422,8 @@ def test_routed_experts_capturer_dp_modular_local_tokens():
     capturer = _capturer_with_buffer(dp_rank=1)
     num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp),
+        additional_kwargs={},
     )
     topk = torch.tensor([[10, 11], [12, 13], [14, 15]], dtype=torch.int32)
     with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
@@ -312,7 +436,8 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     capturer = _capturer_with_buffer(dp_rank=0)
     num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp),
+        additional_kwargs={},
     )
     # total=5, local=2: n=1 matches neither naive (5) nor modular (2).
     topk = torch.tensor([[1, 2]], dtype=torch.int32)
