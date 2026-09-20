@@ -432,6 +432,33 @@ def test_v2_spec_decode_config_skips_unexpanded_batch():
     assert not ref._warned_spec_decode
 
 
+def test_v2_spec_decode_config_stays_silent_without_dry_rows():
+    # THE REGRESSION THIS PINS IS A WARNING, not a penalty: every step of every
+    # speculative engine reaches apply(), and almost none of those batches
+    # contain a DRY request. What keeps the engine quiet is the empty
+    # active_rows return standing AHEAD of the config gate, so the gate only
+    # speaks for a request that actually asked for DRY. Order the two the other
+    # way and vLLM logs "DRY is not applied with speculative decoding" once on
+    # every speculative server, DRY or no DRY.
+    #
+    # THE WARNING FLAG IS THE WHOLE ASSERTION. Checking the logits here would
+    # read as if it discriminated, and it cannot: with DRY off for every row
+    # there is nothing to subtract, so the logits come back untouched whichever
+    # side of the gate the empty-batch return sits on. Same for seeding the
+    # token history: no row is active, so nothing reads it.
+    state, _ = _make_v2_state(speculative_config=SimpleNamespace())
+    state.add_request(0, SamplingParams())  # dry off, as almost every request is
+    state.add_request(1, SamplingParams())
+    _apply(
+        state,
+        torch.zeros(2, 32, device=DEVICE),
+        np.array([0, 1]),
+        np.array([8, 8]),
+        expanded_logits=False,
+    )
+    assert not state._warned_spec_decode
+
+
 @pytest.mark.parametrize("chunk_budget", [4096, dry_core_mod._CHUNK_BYTE_BUDGET])
 def test_v2_matches_reference_fuzz(chunk_budget, monkeypatch):
     # The V2 window-gather + routing path must agree with the sequential
@@ -846,8 +873,10 @@ def test_dry_rejected_under_speculative_decoding():
     """DRY must be refused with a speculative config, not left to the sampler.
 
     The sampler does skip it consistently, on a gate keyed to the engine's
-    speculative config rather than on the batch shape, which
-    test_v2_spec_decode_config_skips_unexpanded_batch pins. But a skip is silent:
+    speculative config rather than on the batch shape:
+    test_v2_spec_decode_config_skips_unexpanded_batch pins that it catches an
+    unexpanded batch, and test_v2_spec_decode_config_stays_silent_without_dry_rows
+    that it does not warn for a batch with no DRY request. But a skip is silent:
     the request is accepted and no penalty is ever applied, so the caller learns
     nothing. Refusing is the honest behaviour and matches how min_p and
     logit_bias are handled.
