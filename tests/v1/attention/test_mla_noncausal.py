@@ -19,6 +19,10 @@ class _NonCausalMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     supports_non_causal_multi_token_decode = True
 
 
+class _CausalOnlyMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+    pass
+
+
 def _metadata(
     query_start_loc: list[int],
     num_tokens: int | None = None,
@@ -137,3 +141,49 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
     assert MLAAttentionSpec.merge([unmarked, marked]).non_causal_multi_token_decode
+
+
+def test_builder_scopes_noncausal_capability_to_its_layers():
+    merged_spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        non_causal_multi_token_decode=True,
+    )
+    static_forward_context = {
+        "target": SimpleNamespace(non_causal_multi_token_decode=False),
+        "draft": SimpleNamespace(non_causal_multi_token_decode=True),
+    }
+    resolve = MLACommonMetadataBuilder._resolve_non_causal_multi_token_decode
+
+    assert not resolve(merged_spec, ["target"], static_forward_context)
+    assert resolve(merged_spec, ["draft"], static_forward_context)
+    assert resolve(merged_spec, ["target", "draft"], static_forward_context)
+    assert not resolve(merged_spec, ["target", "missing"], static_forward_context)
+
+
+def test_builder_falls_back_to_group_capability_without_layers():
+    kwargs = {
+        "block_size": 64,
+        "num_kv_heads": 1,
+        "head_size": 576,
+        "dtype": torch.bfloat16,
+    }
+    resolve = MLACommonMetadataBuilder._resolve_non_causal_multi_token_decode
+
+    assert resolve(
+        MLAAttentionSpec(**kwargs, non_causal_multi_token_decode=True), ["missing"], {}
+    )
+    assert not resolve(MLAAttentionSpec(**kwargs), ["missing"], {})
+
+
+def test_target_only_builder_validates_causal_dspark_dcp():
+    builder = object.__new__(_CausalOnlyMLAMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dspark"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+    builder.non_causal_multi_token_decode = False
+
+    builder._validate_dspark_dcp_support(supports_dcp_with_varlen=True)
