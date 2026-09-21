@@ -390,35 +390,53 @@ class DecodeBenchConnectorWorker:
         allowing decode performance testing with larger context sizes.
 
         Supports both single- and multi-group KV cache configurations.
+
+        Block IDs are merged and deduplicated per KV cache group, and
+        shared state tensors are filled once by object identity, so hybrid
+        layouts that reuse the same tensor across requests or layers are
+        not rewritten repeatedly at large batch sizes.
         """
         if not metadata.reqs_to_fill:
             return
 
         assert self.kv_caches is not None, "KV caches must be registered before filling"
 
-        for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
+        unique_blocks_per_group: dict[int, set[int]] = {}
+        total_tokens = 0
+        for _, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
+            total_tokens += num_tokens
             for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
+                if block_ids:
+                    unique_blocks_per_group.setdefault(group_idx, set()).update(
+                        block_ids
+                    )
 
-            block_counts = tuple(len(group) for group in block_ids_per_group)
-            logger.debug(
-                "DecodeBenchConnector: Filled %d total blocks (%d tokens) across "
-                "%d groups for request %s (per-group counts: %s)",
-                sum(block_counts),
-                num_tokens,
-                len(block_ids_per_group),
-                req_id,
-                ", ".join(map(str, block_counts)),
-            )
+        filled_tensors: set[int] = set()
+        for group_idx, unique_ids in unique_blocks_per_group.items():
+            self._fill_blocks(group_idx, sorted(unique_ids), filled_tensors)
 
-    def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
+        logger.debug(
+            "DecodeBenchConnector: Filled %d unique block IDs (%d tokens) "
+            "across %d groups from %d requests",
+            sum(len(ids) for ids in unique_blocks_per_group.values()),
+            total_tokens,
+            len(unique_blocks_per_group),
+            len(metadata.reqs_to_fill),
+        )
+
+    def _fill_blocks(
+        self,
+        group_idx: int,
+        block_ids: list[int],
+        filled_tensors: set[int],
+    ):
         """Fill specified blocks with dummy values for a specific KV cache group.
 
         Args:
-            group_idx: The KV cache group index to fill
-            block_ids: List of block IDs to fill in this group
-            num_tokens: Total number of tokens to fill across these blocks
+            group_idx: The KV cache group index to fill.
+            block_ids: Unique block IDs to fill in this group.
+            filled_tensors: Object identities of tensors already filled in
+                this ``start_fill_kv`` invocation.
 
         """
         if not block_ids:
@@ -455,11 +473,15 @@ class DecodeBenchConnectorWorker:
             # dimension — so fill each tensor in its entirety with the same
             # dummy values.
             if isinstance(kv_cache, torch.Tensor):
+                if self._already_filled(kv_cache, filled_tensors):
+                    continue
                 self._fill_block_tensor(kv_cache, block_ids, fill_mean, fill_std)
             elif isinstance(kv_cache, (list, tuple)) and all(
                 isinstance(t, torch.Tensor) for t in kv_cache
             ):
                 for state_tensor in kv_cache:
+                    if self._already_filled(state_tensor, filled_tensors):
+                        continue
                     self._fill_state_tensor(state_tensor, fill_mean, fill_std)
             else:
                 logger.warning_once(
@@ -480,6 +502,15 @@ class DecodeBenchConnectorWorker:
             fill_std,
         )
 
+    @staticmethod
+    def _already_filled(tensor: torch.Tensor, filled_tensors: set[int]) -> bool:
+        """Return True if this tensor object was already filled this invocation."""
+        tensor_id = id(tensor)
+        if tensor_id in filled_tensors:
+            return True
+        filled_tensors.add(tensor_id)
+        return False
+
     def _fill_block_tensor(
         self,
         kv_cache: torch.Tensor,
@@ -489,6 +520,9 @@ class DecodeBenchConnectorWorker:
     ):
         """Fill the requested block rows of a block-indexed KV cache tensor.
 
+        Contiguous block ranges are written in place. Sparse IDs use an
+        indexed write so a full-batch temporary value tensor is not created.
+
         Args:
             kv_cache: A KV cache tensor whose first dim is num_blocks.
             block_ids: Block IDs to fill. IDs that are out of range for this
@@ -497,40 +531,34 @@ class DecodeBenchConnectorWorker:
             fill_std: Standard deviation for the fill.
 
         """
-        # Convert block_ids to tensor on device
-        block_ids_tensor = torch.tensor(
-            block_ids, dtype=torch.long, device=kv_cache.device
-        )
-
-        # Filter invalid block IDs
-        valid_mask = block_ids_tensor < kv_cache.shape[0]
-        valid_block_ids = block_ids_tensor[valid_mask]
-
-        if len(valid_block_ids) == 0:
+        num_blocks = kv_cache.shape[0]
+        valid = sorted({block_id for block_id in block_ids if block_id < num_blocks})
+        if not valid:
             return
 
-        # Create fill values - either constant or random
-        block_shape = kv_cache.shape[1:]
-        if fill_std > 0:
-            # Random normal sampling
-            fill_values = torch.normal(
-                mean=fill_mean,
-                std=fill_std,
-                size=(len(valid_block_ids),) + block_shape,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
-        else:
-            # Constant fill value
-            fill_values = torch.full(
-                (len(valid_block_ids),) + block_shape,
-                fill_mean,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
+        lo, hi = valid[0], valid[-1] + 1
+        is_contiguous = hi - lo == len(valid)
 
-        # Batch fill operation
-        kv_cache[valid_block_ids] = fill_values
+        if fill_std <= 0:
+            if is_contiguous:
+                kv_cache[lo:hi].fill_(fill_mean)
+            else:
+                index = torch.tensor(valid, dtype=torch.long, device=kv_cache.device)
+                kv_cache.index_fill_(0, index, fill_mean)
+            return
+
+        if is_contiguous:
+            kv_cache[lo:hi].normal_(mean=fill_mean, std=fill_std)
+            return
+
+        index = torch.tensor(valid, dtype=torch.long, device=kv_cache.device)
+        fill_values = torch.empty(
+            (len(valid),) + kv_cache.shape[1:],
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        fill_values.normal_(mean=fill_mean, std=fill_std)
+        kv_cache.index_copy_(0, index, fill_values)
 
     def _fill_state_tensor(
         self, kv_cache: torch.Tensor, fill_mean: float, fill_std: float
