@@ -31,7 +31,7 @@ steps:
       pytest -v -s v1/engine/test_llm_engine.py -k "not test_engine_metrics" &&
       pytest -v -s v1/e2e/general/test_context_length.py &&
       ENFORCE_EAGER=1 pytest -v -s v1/e2e/general/test_async_scheduling.py -k "not ngram" &&
-      pytest -v -s entrypoints/llm/test_struct_output_generate.py -k "xgrammar and not speculative_config6 and not speculative_config7 and not speculative_config8 and not speculative_config0" &&
+      pytest -v -s entrypoints/llm/structured_output -k "xgrammar and not speculative_config6 and not speculative_config7 and not speculative_config8 and not speculative_config0" &&
       pytest -v -s v1/e2e/general/test_min_tokens.py'
 
 - label: Model Runner V2 Examples (Intel)
