@@ -97,8 +97,10 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
             score = self._new_score(nd, d.max_seq_len)
             score.fill_(float("-inf"))
 
-            # Score owned blocks into a shard-shaped buffer, then scatter.
-            shard_score = self._new_score(nd, owned_cols.shape[0] * 128)
+            # Score owned blocks. shard_score uses d.max_seq_len so its
+            # block-axis width (score_block_width) matches the global score,
+            # making owned_cols column indices directly valid for both tensors.
+            shard_score = self._new_score(nd, d.max_seq_len)
             pa_sparse_block_score_decode(
                 iq[:nd],
                 kv,
@@ -108,8 +110,9 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 query_len=d.decode_query_len,
-                max_seq_len=owned_cols.shape[0] * 128,
+                max_seq_len=d.max_seq_len,
             )
+            # Scatter per-block scores into global tensor at owned column positions.
             n_owned = min(len(owned_cols), shard_score.shape[-1])
             score[..., owned_cols[:n_owned]] = shard_score[..., :n_owned]
 
