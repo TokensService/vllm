@@ -428,9 +428,6 @@ steps:
   - vllm/v1/attention/ops/triton_turboquant_decode.py
   - vllm/v1/attention/ops/triton_turboquant_store.py
   commands:
-  # One kv-cache-dtype per shard, worst of five main runs (builds 89152-89200):
-  # k8v4 14.4m, t4nc 14.6m, k3v4nc 12.4m, t3nc 12.6m. New TurboQuant configs
-  # must be added to exactly one models-turboquant-shard-*.txt.
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=evals/gsm8k/configs/models-turboquant-shard-$$BUILDKITE_PARALLEL_JOB.txt
 
 - label: ":nvidia: (H100) GPQA Eval (GPT-OSS)"
