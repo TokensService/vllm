@@ -217,7 +217,8 @@ class RoutedExpertsCapturer:
                 f"layer count {self.device_buffer.shape[1]}"
             )
 
-        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
+        offset = ctx.additional_kwargs.get("routed_experts_token_offset", 0)
+        self.device_buffer[offset : offset + token_num_per_dp, layer_id, :] = topk_ids[
             start_loc:end_loc, :
         ]
 
@@ -229,7 +230,10 @@ class RoutedExpertsCapturer:
         return self.device_buffer
 
     def get_routed_experts(
-        self, slot_mappings: torch.Tensor, num_tokens: int
+        self,
+        slot_mappings: torch.Tensor,
+        num_tokens: int,
+        token_indices: torch.Tensor | None = None,
     ) -> RoutedExpertsTensors:
         """Snapshot this step's routing data and its attention slot mapping.
 
@@ -241,10 +245,18 @@ class RoutedExpertsCapturer:
             slot_mappings: Per-KV-cache-group slot mappings for this step,
                 shape ``(num_kv_cache_groups, max_num_batched_tokens)``.
             num_tokens: Total number of tokens scheduled in this step.
+            token_indices: Physical capture-buffer rows in logical token order.
+                Advanced indexing snapshots these rows directly, avoiding a
+                separate compaction before the existing snapshot copy.
 
         """
+        routing_data = (
+            self.device_buffer[:num_tokens].clone()
+            if token_indices is None
+            else self.device_buffer[token_indices]
+        )
         return RoutedExpertsTensors(
-            routing_data=self.device_buffer[:num_tokens].clone(),
+            routing_data=routing_data,
             slot_mapping=slot_mappings[self.attn_gid, :num_tokens].clone(),
         )
 

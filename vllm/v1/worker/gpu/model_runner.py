@@ -21,7 +21,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -169,7 +169,9 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
+    compact_staged_rows,
     maybe_build_ubatch_runner,
+    restore_staged_inputs,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
@@ -1912,6 +1914,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 **connector_kwargs, attn_metadata=attn_metadata
             )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if ubatch_state is not None and ubatch_state.staged_rows is not None:
+                model_output = cast(torch.Tensor, model_output)
+                staged_rows = ubatch_state.staged_rows
+                compact_staged_rows(model_output, staged_rows)
+                restore_staged_inputs(
+                    input_batch,
+                    cast(tuple[torch.Tensor, ...], block_tables),
+                    cast(torch.Tensor, slot_mappings),
+                    staged_rows,
+                )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1972,7 +1984,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
             assert slot_mappings is not None
-            routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
+            routed_rows = ubatch_state.staged_rows if ubatch_state is not None else None
+            routed_experts = capturer.get_routed_experts(
+                slot_mappings, num_toks, routed_rows
+            )
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
