@@ -15,6 +15,7 @@ use serde_with::{DeserializeFromStr, SerializeDisplay};
 use self::reasoning::ReasoningParserFactory;
 use self::tool::ToolParserFactory;
 use self::unified::UnifiedParserFactory;
+use thiserror_ext::AsReport as _;
 
 /// Specify which reasoning or tool-call parser implementation to use.
 #[derive(Debug, Clone, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
@@ -117,17 +118,53 @@ impl fmt::Display for ToolStrictLevel {
     }
 }
 
-/// Validate explicit parser override names without starting request processing.
+/// Validate parser overrides without starting request processing: explicit
+/// names must be registered, and two enabled parsers resolved for `model_id`
+/// must not split a unified parser between the tool and reasoning sides. A
+/// split with one side disabled only affects chat completions (every other
+/// route keeps serving), so it is logged and left to the per-request check.
 pub fn validate_parser_overrides(
     tool_call_parser: &ParserSelection,
     reasoning_parser: &ParserSelection,
+    model_id: &str,
 ) -> crate::Result<()> {
     validate_selection(tool_call_parser, "tool", ToolParserFactory::global())?;
     validate_selection(
         reasoning_parser,
         "reasoning",
         ReasoningParserFactory::global(),
-    )
+    )?;
+    let tool_name = tool_call_parser.resolve_tool_name(model_id);
+    let reasoning_name = reasoning_parser.resolve_reasoning_name(model_id);
+    match validate_unified_selection(tool_name, reasoning_name) {
+        Err(error) if tool_name.is_some() && reasoning_name.is_some() => Err(error),
+        Err(error) => {
+            tracing::warn!(
+                error = %error.as_report(),
+                "chat completions will reject requests until the tool and reasoning parser selections agree"
+            );
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// A unified parser owns the whole stream, so when either resolved selection
+/// names one, both must name the same parser.
+pub(crate) fn validate_unified_selection(
+    tool_name: Option<&str>,
+    reasoning_name: Option<&str>,
+) -> crate::Result<()> {
+    let unified = UnifiedParserFactory::global();
+    let involves_unified =
+        tool_name.into_iter().chain(reasoning_name).any(|name| unified.contains(name));
+    if involves_unified && tool_name != reasoning_name {
+        return Err(crate::Error::IncompatibleParserSelections {
+            tool: tool_name.unwrap_or("none").to_owned(),
+            reasoning: reasoning_name.unwrap_or("none").to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_selection<C>(

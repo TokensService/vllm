@@ -573,7 +573,6 @@ mod tests {
 
     use serde_json::{Value, json};
     use thiserror_ext::AsReport;
-    use vllm_tokenizer::DecodedText;
     use vllm_tokenizer::Tokenizer as _;
     use vllm_tokenizer::test_utils::TestTokenizer;
 
@@ -581,10 +580,11 @@ mod tests {
         END_OF_MSG, KimiK3UnifiedParser, OPEN, RESPONSE_CLOSE, RESPONSE_OPEN, SEP, THINK_CLOSE,
         THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
     };
-    use crate::tool::ToolCallDelta;
-    use crate::unified::{
-        UnifiedParser, UnifiedParserError, UnifiedParserEvent, UnifiedParserOutput,
+    use crate::tool::test_utils::split_by_chars;
+    use crate::unified::test_utils::{
+        UnifiedOutputTestExt, UnifiedParserTestExt, collect_stream, first_call,
     };
+    use crate::unified::{UnifiedParser, UnifiedParserError, UnifiedParserOutput};
 
     const OPEN_ID: u32 = 256;
     const CLOSE_ID: u32 = 257;
@@ -599,80 +599,8 @@ mod tests {
             .with_special_token(END_OF_MSG, END_OF_MSG_ID)
     }
 
-    trait UnifiedParserTestExt {
-        fn parse_chunk(&mut self, chunk: &str) -> super::Result<UnifiedParserOutput>;
-        fn parse_complete(&mut self, text: &str) -> super::Result<UnifiedParserOutput>;
-    }
-
-    impl UnifiedParserTestExt for KimiK3UnifiedParser {
-        fn parse_chunk(&mut self, chunk: &str) -> super::Result<UnifiedParserOutput> {
-            let mut output = UnifiedParserOutput::default();
-            self.parse_into(DecodedText::unattributed(chunk), &mut output)?;
-            Ok(output)
-        }
-
-        fn parse_complete(&mut self, text: &str) -> super::Result<UnifiedParserOutput> {
-            let mut output = self.parse_chunk(text)?;
-            output.append(self.finish()?);
-            Ok(output)
-        }
-    }
-
-    trait UnifiedOutputTestExt {
-        fn normal_text(&self) -> String;
-        fn reasoning_text(&self) -> String;
-        fn calls(&self) -> Vec<ToolCallDelta>;
-    }
-
-    impl UnifiedOutputTestExt for UnifiedParserOutput {
-        fn normal_text(&self) -> String {
-            self.events
-                .iter()
-                .filter_map(|event| match event {
-                    UnifiedParserEvent::Text(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn reasoning_text(&self) -> String {
-            self.events
-                .iter()
-                .filter_map(|event| match event {
-                    UnifiedParserEvent::Reasoning(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn calls(&self) -> Vec<ToolCallDelta> {
-            self.events
-                .iter()
-                .filter_map(|event| match event {
-                    UnifiedParserEvent::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
-    }
-
     fn test_parser() -> KimiK3UnifiedParser {
         KimiK3UnifiedParser::new(&[], Arc::new(tokenizer())).unwrap()
-    }
-
-    fn collect_stream(parser: &mut KimiK3UnifiedParser, chunks: &[&str]) -> UnifiedParserOutput {
-        let mut output = UnifiedParserOutput::default();
-        for chunk in chunks {
-            output.append(parser.parse_chunk(chunk).unwrap());
-        }
-        output.append(parser.finish().unwrap());
-        output
-    }
-
-    /// Split `text` into small chunks to stress marker-split handling.
-    fn char_chunks(text: &str, size: usize) -> Vec<String> {
-        let chars: Vec<char> = text.chars().collect();
-        chars.chunks(size).map(|chunk| chunk.iter().collect()).collect()
     }
 
     fn arg(key: &str, arg_type: &str, value: &str) -> String {
@@ -693,10 +621,6 @@ mod tests {
         }
         output.push_str("<|close|>message<|sep|>");
         output
-    }
-
-    fn first_call(output: &UnifiedParserOutput) -> ToolCallDelta {
-        output.calls().first().expect("expected one tool call").clone()
     }
 
     #[test]
@@ -776,9 +700,7 @@ mod tests {
         );
 
         for size in [1, 3, 7] {
-            let chunks = char_chunks(&text, size);
-            let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
-            let output = collect_stream(&mut test_parser(), &chunk_refs);
+            let output = collect_stream(&mut test_parser(), &split_by_chars(&text, size));
 
             assert_eq!(output.reasoning_text(), "step by step", "chunk size {size}");
             assert_eq!(output.normal_text(), "the answer", "chunk size {size}");

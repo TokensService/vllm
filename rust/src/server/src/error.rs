@@ -194,6 +194,29 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_structured_outputs_maps_to_invalid_request() {
+        let error = vllm_chat::Error::UnsupportedStructuredOutputs {
+            message: "the constraint cannot be combined with tool calls for this parser"
+                .to_string(),
+        };
+        let api_error = chat_submit_error("failed to submit chat request", error);
+        assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            api_error.to_error_response().error.error_type,
+            "invalid_request_error"
+        );
+    }
+
+    #[test]
+    fn structural_tag_build_failure_maps_to_server_error() {
+        let error = vllm_chat::Error::StructuralTag {
+            message: "unsupported tool schema".to_string(),
+        };
+        let api_error = chat_submit_error("failed to submit chat request", error);
+        assert_eq!(api_error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
     fn llm_wrapped_empty_prompt_maps_to_invalid_request() {
         let error = vllm_text::Error::Llm(vllm_llm::Error::EmptyPromptTokenIds {
             request_id: "req-1".to_string(),
@@ -282,5 +305,20 @@ mod tests {
         assert_eq!(api_error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         let response = api_error.to_error_response();
         assert!(response.error.message.starts_with("failed to submit completion request:"));
+    }
+
+    #[test]
+    fn incompatible_parser_selections_maps_to_server_error() {
+        // An operator misconfiguration, like `ParserDisabled`, stays a 500.
+        let error = vllm_chat::Error::IncompatibleParserSelections {
+            tool: "none".to_string(),
+            reasoning: "muse_glimmer".to_string(),
+        };
+        let api_error = chat_submit_error("failed to submit chat request", error);
+        assert_eq!(api_error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            api_error.to_error_response().error.error_type,
+            "server_error"
+        );
     }
 }
