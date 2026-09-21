@@ -170,6 +170,58 @@ def test_flush_posts_each_pending_receive_once():
     assert [sequence for sequence, _ in launches] == [0, 1]
 
 
+def test_missed_post_model_launch_preserves_fifo_order():
+    handler, launches = _make_handler(pp_size=4, delay=3, post_model=True)
+
+    for step in range(5):
+        handler.step = step
+        handler._advance_receive_queue()
+        # Deliberately skip step 3's post-model launch. Selecting step 1's
+        # receive on step 4 must first launch step 0's older receive.
+        if step == 4:
+            handler.launch_post_model_receive()
+        handler._queue_receive(cast(PendingRecv, _FakeSlot(step)))
+
+    assert launches == [(0, 4), (1, 4)]
+
+
+def test_immediate_receive_posts_broadcasts_once_in_order(monkeypatch):
+    handler = PPHandler.__new__(PPHandler)
+    handler.queue = deque([None])
+    handler.recv_launch_delay = 0
+    handler.main_stream = Mock()
+    handler.broadcast_stream = Mock()
+    handler.broadcast_stream.record_event.return_value = Mock()
+    handler.last_rank = 3
+    handler.broadcast_group = Mock()
+    sampled_tokens, combined, draft_tokens = Mock(), Mock(), Mock()
+    slot = PendingRecv(
+        None,
+        sampled_tokens,
+        combined,
+        Mock(),
+        Mock(),
+        Mock(),
+        np.array([0]),
+        np.array([True]),
+        np.array([0]),
+        draft_tokens,
+    )
+    broadcast = Mock()
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+
+    handler._queue_receive(slot)
+    handler._launch_receive(slot)
+
+    assert handler.queue[-1] is slot
+    assert broadcast.call_args_list == [
+        call(sampled_tokens, src=3, group=handler.broadcast_group),
+        call(combined, src=3, group=handler.broadcast_group),
+        call(draft_tokens, src=3, group=handler.broadcast_group),
+    ]
+
+
 def test_deferred_receive_includes_speculative_drafts(monkeypatch):
     handler = PPHandler.__new__(PPHandler)
     handler.main_stream = Mock()

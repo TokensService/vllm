@@ -22,7 +22,8 @@ class PendingRecv:
     event: torch.cuda.Event | None
 
     sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
-    combined: torch.Tensor  # [2, num_reqs]: num_sampled, num_rejected
+    combined: torch.Tensor  # [2, num_reqs]: broadcast backing storage
+    # Views into `combined`; a deferred broadcast updates them in place.
     num_sampled: torch.Tensor  # [num_reqs]
     num_rejected: torch.Tensor  # [num_reqs]
     idx_mapping: torch.Tensor  # [num_reqs]
@@ -50,8 +51,11 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
 def _default_recv_launch_delay(pp_size: int, async_scheduling: bool | None) -> int:
     """Return the automatic sampled-token receive delay.
 
-    Async CUDA-like workers can post the receive after model work on the last
-    step before it is consumed. Other configurations retain immediate posting.
+    Async scheduling keeps multiple pipeline steps in flight, so the receive
+    can overlap later work and still be posted on the last step before it is
+    consumed. Synchronous scheduling cannot use that overlap and retains the
+    upstream immediate-posting behavior. Non-CUDA-like platforms do likewise
+    because this implementation relies on CUDA stream ordering.
     """
     if async_scheduling and current_platform.is_cuda_alike():
         return max(0, pp_size - 1)
@@ -179,7 +183,10 @@ class PPHandler:
             launch_slot = self.queue[-self.recv_launch_delay]
             if launch_slot is not None:
                 if self.post_model_recv_launch:
-                    assert self.pending_post_model_receive is None
+                    if self.pending_post_model_receive is not None:
+                        # A prior step missed its post-model launch. Post that
+                        # older slot first to preserve collective FIFO order.
+                        self._launch_receive(self.pending_post_model_receive)
                     self.pending_post_model_receive = launch_slot
                 else:
                     self._launch_receive(launch_slot)
@@ -207,7 +214,12 @@ class PPHandler:
         return True
 
     def flush_pending_collectives(self) -> None:
-        """Post all deferred receives before an idle boundary or shutdown."""
+        """Post all deferred receives before an idle boundary or shutdown.
+
+        Every non-last rank in the PP group must call this at the same logical
+        boundary. The matching broadcasts are ordered collectives, so a
+        rank-local flush condition could desynchronize the group and hang it.
+        """
         if self.is_last_rank:
             return
 
@@ -231,6 +243,9 @@ class PPHandler:
         if slot is None:
             return None
 
+        # Post the receive before filtering. The last PP rank has already
+        # posted the matching broadcasts, so even an all-excluded local step
+        # must participate to preserve the group's collective order.
         self._launch_receive(slot)
         assert slot.event is not None
 
@@ -303,6 +318,9 @@ class PPHandler:
                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+            # These are views of the broadcast target. Creating them before a
+            # deferred broadcast is intentional: filling `combined` updates
+            # both views in place.
             num_sampled, num_rejected = combined.unbind(dim=0)
             draft_tokens = None
             if self.num_speculative_steps > 0:
