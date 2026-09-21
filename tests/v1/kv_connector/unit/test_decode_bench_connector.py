@@ -870,9 +870,7 @@ def test_decode_bench_connector_fills_shared_layer_tensor_once():
         head_size=1,
         dtype=torch.float32,
     )
-    connector = _make_decode_bench_worker(
-        ["layer_a", "layer_b"], spec, num_gpu_blocks
-    )
+    connector = _make_decode_bench_worker(["layer_a", "layer_b"], spec, num_gpu_blocks)
     shared = torch.zeros(num_gpu_blocks, 2)
     connector.register_kv_caches({"layer_a": shared, "layer_b": shared})
 
@@ -916,9 +914,7 @@ def test_decode_bench_connector_fills_shared_state_tensors_once():
     state_conv = torch.zeros(4, 5)
     state_ssm = torch.zeros(2, 3)
     shared_states = [state_conv, state_ssm]
-    connector.register_kv_caches(
-        {"linear_a": shared_states, "linear_b": shared_states}
-    )
+    connector.register_kv_caches({"linear_a": shared_states, "linear_b": shared_states})
 
     state_fill_ids: list[int] = []
     worker = connector.connector_worker
