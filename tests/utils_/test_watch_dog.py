@@ -4,8 +4,9 @@ import os
 import time
 from unittest.mock import MagicMock, patch
 
+from vllm.config import WatchdogConfig
 from vllm.utils.safe_fs import get_user_root_dir
-from vllm.utils.watch_dog import WatchDog, get_watch_dog
+from vllm.utils.watch_dog import WatchDog, get_watch_dog, start_watch_dog
 
 
 def test_default_initialization():
@@ -24,15 +25,70 @@ def test_default_initialization():
     )
 
 
-def test_set_name_updates_dump_file():
-    """Verify the watchdog name can be overridden and the dump file name
-    follows it."""
+def test_set_name_does_not_rebuild_dump_file():
+    """Verify set_name() only overrides the watchdog name; the dump file is
+    rebuilt later by set_config(dump_dir=...) on top of the current name."""
     wd = WatchDog()
+    default_dump_file = wd._dump_file
     wd.set_name("worker_0")
     assert wd._name == "worker_0"
+    assert wd._dump_file == default_dump_file
+
+
+def test_set_config_updates_dump_dir_and_dump_file(tmp_path):
+    """Verify set_config(dump_dir=...) rebuilds the dump file name from the
+    current watchdog name."""
+    wd = WatchDog()
+    wd.set_name("worker_0")
+    wd.set_config(dump_dir=str(tmp_path))
+    assert wd._dump_dir == str(tmp_path)
     assert wd._dump_file == os.path.join(
-        wd._dump_dir, f"VLLM_STACK_DUMP_for_worker_0_{os.getpid()}.log"
+        str(tmp_path), f"VLLM_STACK_DUMP_for_worker_0_{os.getpid()}.log"
     )
+
+
+def test_set_config_updates_timeout_only():
+    """Verify set_config(timeout=...) leaves the other parameters untouched."""
+    wd = WatchDog()
+    dump_dir_before = wd._dump_dir
+    wd.set_config(timeout=60)
+    assert wd._timeout == 60
+    assert wd._check_interval == 10
+    assert wd._dump_dir is dump_dir_before
+    assert wd._dump_file == os.path.join(
+        wd._dump_dir, f"VLLM_STACK_DUMP_for_{wd._name}_{os.getpid()}.log"
+    )
+
+
+def test_set_config_updates_check_interval_only():
+    """Verify set_config(check_interval=...) leaves the other parameters
+    untouched."""
+    wd = WatchDog()
+    wd.set_config(check_interval=1)
+    assert wd._check_interval == 1
+    assert wd._timeout == 300
+    assert wd._dump_dir == os.path.join(get_user_root_dir(), "dump")
+
+
+def test_set_config_combines_all_parameters(tmp_path):
+    """Verify set_config() applies all provided parameters at once."""
+    wd = WatchDog()
+    wd.set_name("engine_0")
+    wd.set_config(timeout=100, check_interval=2, dump_dir=str(tmp_path))
+    assert wd._timeout == 100
+    assert wd._check_interval == 2
+    assert wd._dump_dir == str(tmp_path)
+    assert wd._dump_file == os.path.join(
+        str(tmp_path), f"VLLM_STACK_DUMP_for_engine_0_{os.getpid()}.log"
+    )
+
+
+def test_set_config_noop_when_all_none():
+    """Verify set_config() with no arguments changes nothing."""
+    wd = WatchDog()
+    state = (wd._timeout, wd._check_interval, wd._dump_dir, wd._dump_file)
+    wd.set_config()
+    assert (wd._timeout, wd._check_interval, wd._dump_dir, wd._dump_file) == state
 
 
 def test_feed_updates_last_feed_time():
@@ -51,6 +107,7 @@ def test_dump_stack_writes_traceback_files(tmp_path):
     with patch("vllm.utils.watch_dog.get_user_root_dir", return_value=str(tmp_path)):
         wd = WatchDog()
     wd.set_name("test_proc")
+    wd.set_config(dump_dir=str(tmp_path / "dump"))
     wd.start()  # prepares the private dump directory
     try:
         wd.dump_stack("timeout")
@@ -231,3 +288,59 @@ def test_get_watch_dog_returns_shared_singleton():
     second = get_watch_dog()
     assert isinstance(first, WatchDog)
     assert first is second
+
+
+def test_start_watch_dog_stays_dormant_without_dump_dir():
+    """Verify start_watch_dog() keeps the watchdog dormant (not started, no
+    state change) when the config disables the feature via empty dump_dir."""
+    watchdog = WatchDog()
+    with patch("vllm.utils.watch_dog._watch_dog", watchdog):
+        result = start_watch_dog("engine_0", WatchdogConfig())
+    assert result is watchdog
+    assert watchdog._name == "vllm"
+    assert watchdog._timeout == 300
+    assert watchdog._check_interval == 10
+    assert watchdog._thread is None
+
+
+def test_start_watch_dog_applies_config_and_starts(tmp_path):
+    """Verify start_watch_dog() configures and starts the shared watchdog
+    background thread when dump_dir is set."""
+    watchdog = WatchDog()
+    config = WatchdogConfig(timeout=30, check_interval=5, dump_dir=str(tmp_path))
+    with patch("vllm.utils.watch_dog._watch_dog", watchdog):
+        result = start_watch_dog("engine_7", config)
+    try:
+        assert result is watchdog
+        assert watchdog._name == "engine_7"
+        assert watchdog._timeout == 30
+        assert watchdog._check_interval == 5
+        assert watchdog._dump_dir == str(tmp_path)
+        assert watchdog._dump_file == os.path.join(
+            str(tmp_path), f"VLLM_STACK_DUMP_for_engine_7_{os.getpid()}.log"
+        )
+        assert watchdog._thread is not None
+        assert watchdog._thread.is_alive()
+        assert watchdog._thread.daemon is True
+    finally:
+        watchdog.stop()
+
+
+def test_dump_stack_logs_success_via_logger(tmp_path):
+    """Verify a successful dump is reported through the configured logger and
+    increments the dump sequence."""
+    with patch("vllm.utils.watch_dog.get_user_root_dir", return_value=str(tmp_path)):
+        wd = WatchDog()
+    wd.set_config(dump_dir=str(tmp_path / "dump"))
+    os.makedirs(wd._dump_dir)  # prepare the dump directory
+    logger = MagicMock()
+    wd.set_logger(logger)
+    with patch("vllm.utils.watch_dog.safe_open_file", side_effect=open):
+        wd.dump_stack("timeout")
+    logger.info.assert_called_once()
+    message, dump_file, reason = logger.info.call_args[0]
+    assert "Call stack dumped" in message
+    assert dump_file == wd._dump_file
+    assert reason == "timeout"
+    assert os.path.exists(wd._dump_file)
+    assert wd._sequence == 2  # incremented on success

@@ -44,7 +44,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.utils.watch_dog import get_watch_dog
+from vllm.utils.watch_dog import start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -1202,10 +1202,10 @@ class EngineCoreProc(EngineCore):
             )
             self.output_thread.start()
 
-            self._watchdog = get_watch_dog()
-            self._watchdog.set_name(f"engine_{self.engine_index}")
+            self._watchdog = start_watch_dog(
+                f"engine_{self.engine_index}", vllm_config.watchdog_config
+            )
             self._watchdog.set_logger(logger)
-            self._watchdog.start()
 
             # Don't complete handshake until DP coordinator ready message is
             # received.

@@ -66,7 +66,7 @@ from vllm.utils.torch_utils import (
     set_torch_threads_for_runtime,
     startup_omp_num_threads,
 )
-from vllm.utils.watch_dog import get_watch_dog
+from vllm.utils.watch_dog import start_watch_dog
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
@@ -699,10 +699,10 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
-        self._watchdog = get_watch_dog()
-        self._watchdog.set_name(f"worker-{self.rank}")
+        self._watchdog = start_watch_dog(
+            f"worker-{self.rank}", vllm_config.watchdog_config
+        )
         self._watchdog.set_logger(logger)
-        self._watchdog.start()
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)

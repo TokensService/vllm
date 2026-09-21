@@ -4,8 +4,12 @@ import faulthandler
 import os
 import threading
 import time
+from typing import TYPE_CHECKING
 
 from vllm.utils.safe_fs import get_user_root_dir, prepare_private_dir, safe_open_file
+
+if TYPE_CHECKING:
+    from vllm.config import WatchdogConfig
 
 _DEFAULT_NAME = "vllm"
 _DEFAULT_TIMEOUT = 300
@@ -40,10 +44,24 @@ class WatchDog:
     def set_name(self, name):
         """Set the watchdog name for debugging."""
         self._name = name
-        self._dump_file = os.path.join(
-            self._dump_dir,
-            f"VLLM_STACK_DUMP_for_{self._name}_{os.getpid()}.log",
-        )
+
+    def set_config(
+        self,
+        timeout: int | None = None,
+        check_interval: int | None = None,
+        dump_dir: str | None = None,
+    ) -> None:
+        """Override watchdog parameters before start()."""
+        if timeout is not None:
+            self._timeout = timeout
+        if check_interval is not None:
+            self._check_interval = check_interval
+        if dump_dir is not None:
+            self._dump_dir = dump_dir
+            self._dump_file = os.path.join(
+                dump_dir,
+                f"VLLM_STACK_DUMP_for_{self._name}_{os.getpid()}.log",
+            )
 
     def set_logger(self, logger):
         """Set the logger used to report stack-dump failures."""
@@ -131,4 +149,22 @@ _watch_dog = WatchDog()
 
 def get_watch_dog() -> WatchDog:
     """Return the process-wide WatchDog singleton."""
+    return _watch_dog
+
+
+def start_watch_dog(name: str, watchdog_config: "WatchdogConfig") -> WatchDog:
+    """Start the process-wide WatchDog background thread if enabled.
+
+    The watchdog is enabled only when ``watchdog_config.dump_dir`` is set;
+    otherwise it stays dormant. Returns the WatchDog singleton either way.
+    """
+    if not watchdog_config.dump_dir:
+        return _watch_dog
+    _watch_dog.set_name(name)
+    _watch_dog.set_config(
+        timeout=watchdog_config.timeout,
+        check_interval=watchdog_config.check_interval,
+        dump_dir=watchdog_config.dump_dir,
+    )
+    _watch_dog.start()
     return _watch_dog
