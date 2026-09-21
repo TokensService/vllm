@@ -392,6 +392,11 @@ class Scheduler(SchedulerInterface):
         self.enable_omit_prefix_routed_experts = (
             vllm_config.aux_output_config.enable_omit_prefix_routed_experts
         )
+        self._routed_expert_offload = (
+            vllm_config.aux_output_config.enable_return_routed_experts
+            and self.enable_omit_prefix_routed_experts
+            and self.connector is not None
+        )
         self.aux_output_connector = (
             AuxOutputSchedulerConnector(
                 enable_omit_prefix_routed_experts=self.enable_omit_prefix_routed_experts
@@ -525,6 +530,13 @@ class Scheduler(SchedulerInterface):
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
+        if self._bypass_routed_expert_lookup(request):
+            blocks, num_local, boundary = (
+                self.kv_cache_manager.get_computed_blocks_up_to(
+                    request, max_cache_hit_length=request.num_cached_tokens
+                )
+            )
+            return blocks, num_local, boundary, False
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
@@ -533,6 +545,16 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _bypass_routed_expert_lookup(self, request: Request) -> bool:
+        # Before the first sample, the frontend has no prompt routes yet.
+        # Recompute the non-omitted suffix instead of loading KV without routes.
+        return (
+            self._routed_expert_offload
+            and request.num_cached_tokens >= 0
+            and request.num_computed_tokens == 0
+            and request.num_output_tokens == 0
+        )
 
     def _reserve_prefill_lookahead(
         self,
@@ -930,11 +952,12 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
-                            )
+                        lookup = (
+                            self.connector.bypass_external_lookup
+                            if self._bypass_routed_expert_lookup(request)
+                            else self.connector.get_num_new_matched_tokens
                         )
+                        ext_tokens, load_kv_async = lookup(request, block_aligned_local)
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False
 
