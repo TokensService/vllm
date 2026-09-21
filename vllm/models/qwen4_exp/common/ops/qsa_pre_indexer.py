@@ -3,8 +3,42 @@
 """Fused QSA pre-indexer kernel for Qwen4Exp."""
 
 import torch
+from torch import nn
 
 from vllm.triton_utils import tl, triton
+
+
+def supports_fused_pre_indexer(
+    rotary_emb: nn.Module,
+    head_dim: int,
+    num_kv_heads: int,
+    compress_ratio: int,
+) -> bool:
+    """Report whether this indexer's shapes match the fused kernel's assumptions.
+
+    The kernel hard-codes the rotary layout and the single-KV-head group
+    compression it was written for; everything it rejects has a working unfused
+    path. The conditions are all config-shaped, so they hold or fail identically
+    on every platform.
+    """
+    rotary_dim = int(rotary_emb.rotary_dim)
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    return (
+        bool(getattr(rotary_emb, "is_neox_style", False))
+        and (
+            not mrope_section
+            or (
+                len(mrope_section) == 3
+                and sum(mrope_section) == rotary_dim // 2
+                and bool(getattr(rotary_emb, "mrope_interleaved", False))
+            )
+        )
+        and head_dim == 128
+        and rotary_dim == 64
+        and num_kv_heads == 1
+        and compress_ratio > 1
+        and compress_ratio & (compress_ratio - 1) == 0
+    )
 
 
 @triton.jit
@@ -236,6 +270,7 @@ def _qsa_pre_indexer_kernel(
             group_offsets = tl.arange(0, COMPRESS_RATIO)
             source_positions = end_position - (COMPRESS_RATIO - 1) + group_offsets
             source_in_chunk = source_positions >= chunk_start
+            source_in_cache = source_positions < chunk_start
             source_tokens = query_start + source_positions - chunk_start
             source_tokens_valid = (
                 (source_tokens >= query_start)
@@ -250,19 +285,20 @@ def _qsa_pre_indexer_kernel(
                 + safe_state_block * state_cache_stride_block
                 + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
             )
-            # Only the first completed group can cross the chunk boundary. Select
-            # historical rows from the ring without issuing two masked loads.
-            source_base = tl.where(source_in_chunk[:, None], current_base, cached_base)
-            # Pointer selection obscures alignment from Triton's analysis.
-            source_base = tl.multiple_of(source_base, (8, 8))
-            source_valid = tl.where(
-                source_in_chunk, source_tokens_valid, state_block_valid
-            )
-            source = tl.load(
-                source_base + dims[None, :],
-                mask=valid & source_valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
+            # Only the first completed group can cross the chunk boundary, so
+            # every row comes from exactly one of the two sources. Selecting
+            # between the base pointers would need a pointer-typed tl.where,
+            # which ROCm's Triton rejects ("'tt.addptr' op failed to verify
+            # that result type matches ptr type"), so select the loaded values
+            # instead. The two masks are complementary, so no lane fetches from
+            # both and memory traffic is unchanged. Dropping the pointer select
+            # also makes the tl.multiple_of hint unnecessary, because Triton can
+            # now see each base's alignment directly.
+            from_chunk = valid & source_in_chunk[:, None] & source_tokens_valid[:, None]
+            from_cache = valid & source_in_cache[:, None] & state_block_valid
+            current = tl.load(current_base + dims[None, :], mask=from_chunk, other=0.0)
+            cached = tl.load(cached_base + dims[None, :], mask=from_cache, other=0.0)
+            source = tl.where(source_in_chunk[:, None], current, cached).to(tl.float32)
             # Match the unfused path's BF16 pooled tensor before RMSNorm.
             pooled = (
                 (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
@@ -451,6 +487,8 @@ def qsa_pre_indexer(
     section = mrope_section if mrope_section is not None else (0, 0, 0)
     assert len(section) == 3
 
+    # Tuned on 32-lane warps. A ROCm wavefront is 64 lanes, so the same tile is
+    # half the work per lane there; correct either way, not yet retuned.
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
     else:
@@ -505,4 +543,4 @@ def qsa_pre_indexer(
     )
 
 
-__all__ = ["qsa_pre_indexer"]
+__all__ = ["qsa_pre_indexer", "supports_fused_pre_indexer"]
