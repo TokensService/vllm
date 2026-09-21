@@ -2,19 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiniMax-M3 context-parallel Triton indexer for ROCm.
 
-Each TP rank scores its own round-robin shard of KV blocks, then scores are
-allreduced (max) across ranks to reconstruct the full score matrix. The
-standard top-k selector runs on the allreduced result, skipping re-scoring
-via ``precomputed_score``.
+Each TP rank scores its own round-robin shard of KV blocks and writes the
+results into a global-shape ``[heads, tokens, max_block]`` tensor pre-filled
+with ``-inf``. A MAX allreduce across the TP group fills every global position
+from its owning rank. The complete score tensor is forwarded to
+``minimax_m3_index_decode`` via ``precomputed_score`` to skip re-scoring.
 
-Enabled by setting ``VLLM_ROCM_MINIMAX_INDEXER_CP=1``. Activated automatically
-when tensor-parallel world size > 1 on ROCm via ``select_indexer_impl_cls``.
-
-PR 2 in this series replaces the O(blocks) allreduce with an O(topk) candidate
-exchange, further reducing cross-rank collective cost at long context.
+Enabled by ``VLLM_ROCM_MINIMAX_INDEXER_CP=1`` (ROCm, TP>1 only).
 """
 
 import torch
+import torch.distributed as dist
+import triton
 
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_tp_group
@@ -27,16 +26,26 @@ from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerMetadata,
     MiniMaxM3IndexerTritonImpl,
 )
-from vllm.models.minimax_m3.common.ops.index_topk import minimax_m3_index_decode
+from vllm.models.minimax_m3.common.ops.index_topk import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_index_decode,
+)
 
 logger = init_logger(__name__)
+
+
+def _round_up_16(n: int) -> int:
+    return (n + 15) & ~15
 
 
 class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
     """Triton indexer with context-parallel decode scoring for ROCm.
 
-    Decode: each rank scores its own 1/world_size shard → allreduce (max)
-    reconstructs full scores → standard top-k runs on allreduced result.
+    Decode: each rank scores its 1/world_size shard of global KV blocks,
+    scatters into global-shape score tensor, MAX allreduce reconstructs all
+    positions, ``minimax_m3_index_decode(precomputed_score=...)`` skips
+    re-scoring and runs top-k directly.
+
     Prefill: unchanged, delegates to base Triton impl.
     """
 
@@ -78,7 +87,21 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
             world_size = get_tensor_model_parallel_world_size()
             rank = get_tp_group().rank_in_group
 
-            # 1. Each rank scores its own round-robin block shard.
+            max_block = triton.cdiv(d.max_seq_len, SPARSE_BLOCK_SIZE)
+            stride = _round_up_16(max_block)
+
+            # Global score tensor pre-filled with -inf.
+            # Shape matches minimax_m3_index_decode_score output.
+            global_score = torch.full(
+                (self.num_index_heads, nd, stride),
+                float("-inf"),
+                dtype=torch.float32,
+                device=iq.device,
+            )
+
+            # Each rank scores its round-robin shard of global blocks.
+            # indexer_context_scores returns [heads, tokens, local_blocks]
+            # where local_blocks = ceil(max_block / world_size).
             local_scores = indexer_context_scores(
                 iq[:nd],
                 kv,
@@ -91,17 +114,25 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
                 self.scale,
             )
 
-            # 2. Max-allreduce: reconstruct full [heads, tokens, blocks].
-            #    Each rank's -inf placeholders become the owning rank's scores.
-            import torch.distributed as dist
+            # Scatter local scores into global tensor at owned column indices:
+            # global_block = local_block * world_size + rank
+            owned_cols = torch.arange(
+                rank, max_block, world_size, device=iq.device
+            )
+            local_blocks = local_scores.shape[2]
+            n_owned = min(len(owned_cols), local_blocks)
+            global_score[:, :, owned_cols[:n_owned]] = local_scores[
+                :, :, :n_owned
+            ]
 
+            # MAX allreduce: each rank's -inf placeholders are replaced by the
+            # owning rank's real scores. Result is the full global score matrix.
             dist.all_reduce(
-                local_scores,
+                global_score,
                 op=dist.ReduceOp.MAX,
                 group=get_tp_group().device_group,
             )
 
-            # 3. Top-k using precomputed scores (skips internal re-scoring).
             fused_sparse_kwargs: dict = {}
             if attention_block_table is not None:
                 fused_sparse_kwargs = {
@@ -123,7 +154,7 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
                 d.decode_query_len,
                 d.max_decode_query_len,
                 out=buf_htk,
-                precomputed_score=local_scores,
+                precomputed_score=global_score,
                 **fused_sparse_kwargs,
             )
 
