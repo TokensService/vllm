@@ -152,6 +152,9 @@ class PPHandler:
         if slot.event is not None:
             return
         with torch.cuda.stream(self.broadcast_stream):
+            # This preserves upstream's main-to-broadcast stream dependency for
+            # immediate receives. Deferred callers invoke this after the model,
+            # so the same dependency places the receive behind model kernels.
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
                 slot.sampled_tokens,
@@ -313,7 +316,6 @@ class PPHandler:
 
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
             sampled_tokens = torch.empty(
                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
             )
@@ -330,28 +332,8 @@ class PPHandler:
                     dtype=torch.int64,
                     device=self.device,
                 )
-            event = None
-            if self.recv_launch_delay == 0:
-                # Keep the default path's ordering identical to upstream.
-                torch.distributed.broadcast(
-                    sampled_tokens, src=self.last_rank, group=self.broadcast_group
-                )
-                torch.distributed.broadcast(
-                    combined, src=self.last_rank, group=self.broadcast_group
-                )
-                if draft_tokens is not None:
-                    torch.distributed.broadcast(
-                        draft_tokens,
-                        src=self.last_rank,
-                        group=self.broadcast_group,
-                    )
-                event = self.broadcast_stream.record_event()
-            sampled_tokens.record_stream(self.main_stream)
-            combined.record_stream(self.main_stream)
-            if draft_tokens is not None:
-                draft_tokens.record_stream(self.main_stream)
         slot = PendingRecv(
-            event,
+            None,
             sampled_tokens,
             combined,
             num_sampled,

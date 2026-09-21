@@ -189,32 +189,44 @@ def test_immediate_receive_posts_broadcasts_once_in_order(monkeypatch):
     handler = PPHandler.__new__(PPHandler)
     handler.queue = deque([None])
     handler.recv_launch_delay = 0
+    handler.is_last_rank = False
+    handler.req_idx_gen_np = np.zeros(1, dtype=np.int32)
+    handler.max_sample_len = 2
+    handler.num_speculative_steps = 1
+    handler.device = torch.device("cuda")
     handler.main_stream = Mock()
     handler.broadcast_stream = Mock()
-    handler.broadcast_stream.record_event.return_value = Mock()
+    event = Mock()
+    handler.broadcast_stream.record_event.return_value = event
     handler.last_rank = 3
     handler.broadcast_group = Mock()
     sampled_tokens, combined, draft_tokens = Mock(), Mock(), Mock()
-    slot = PendingRecv(
-        None,
-        sampled_tokens,
-        combined,
-        Mock(),
-        Mock(),
-        Mock(),
-        np.array([0]),
-        np.array([True]),
-        np.array([0]),
-        draft_tokens,
+    num_sampled, num_rejected = Mock(), Mock()
+    combined.unbind.return_value = (num_sampled, num_rejected)
+    input_batch = _batch(
+        num_computed=[100],
+        prefill_len=[100],
+        num_scheduled=[1],
     )
+    input_batch.idx_mapping = Mock()
+    input_batch.idx_mapping_np = np.array([0])
     broadcast = Mock()
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
     monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+    monkeypatch.setattr(
+        torch, "empty", Mock(side_effect=[sampled_tokens, combined, draft_tokens])
+    )
 
-    handler._queue_receive(slot)
+    assert handler.receive(input_batch)
+    slot = handler.queue[-1]
+    assert slot is not None
+    assert slot.event is event
+    assert slot.num_sampled is num_sampled
+    assert slot.num_rejected is num_rejected
+    handler.broadcast_stream.wait_stream.assert_called_once_with(handler.main_stream)
+    # A later safety launch must not post a second broadcast set.
     handler._launch_receive(slot)
 
-    assert handler.queue[-1] is slot
     assert broadcast.call_args_list == [
         call(sampled_tokens, src=3, group=handler.broadcast_group),
         call(combined, src=3, group=handler.broadcast_group),
