@@ -215,6 +215,7 @@ class DeepseekV41ForCausalLM(
         image_input: DeepseekV4VLImagePixelInputs,
     ) -> tuple[torch.Tensor, ...]:
         patches = image_input.patches
+        assert self.multimodal_config is not None
         if not self.multimodal_config.mm_device_do_normalize:
             patches = patches.to(self.aligner.w1.weight.dtype)
         vit_grid = image_input.vit_grid.tolist()
