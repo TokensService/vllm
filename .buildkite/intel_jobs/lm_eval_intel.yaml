@@ -27,6 +27,7 @@ steps:
       cd tests &&
       pytest -s -v evals/gpt_oss/test_gpqa_correctness.py --config-list-file=configs/models-xpu.txt'
 - label: GSM8K DeepSeek-V2-Lite-Instruct-FP8
+  key: gsm8k-deepseek-v2-lite-instruct-fp8
   timeout_in_minutes: 90
   device: intel_gpu
   agent_tags:
