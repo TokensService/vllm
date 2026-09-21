@@ -40,7 +40,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    drop_checkpoint_cache,
+)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -202,6 +205,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
+        engram_prefetch_stream: torch.cuda.Stream | None = None,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
     ):
@@ -224,6 +228,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     engram_layout.layer_ids.index(layer_id),
                     use_sequence_parallel=self.use_sequence_parallel,
                     prefix=f"{prefix}.engram",
+                    prefetch_stream=engram_prefetch_stream,
                 )
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -590,12 +595,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.engram_layout = EngramLayout.from_config(config)
         engram_config = vllm_config.engram_config
+        self.vllm_config = vllm_config
+        engram_prefetch_stream = (
+            torch.cuda.Stream()
+            if self.engram_layout is not None
+            and engram_config is not None
+            and engram_config.cpu_offload
+            else None
+        )
         if (
             self.engram_layout is not None
             and engram_config is not None
             and engram_config.dp_shared_memory
         ):
             engram_config.dp_shared_memory = can_share_engram_tables(self.engram_layout)
+
+        if self.engram_layout is not None and engram_config and engram_config.use_thp:
+            # Release old checkpoint cache before allocating the Engram host tables.
+            model_config = vllm_config.model_config
+            drop_checkpoint_cache(
+                model_config.model_weights or model_config.model,
+                revision=model_config.revision,
+                cache_dir=vllm_config.load_config.download_dir,
+            )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -606,6 +628,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
+                engram_prefetch_stream=engram_prefetch_stream,
                 mhc_stream=mhc_stream,
                 fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
             ),
@@ -1293,6 +1316,20 @@ class DeepseekV41LLMForCausalLM(
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
+        config = self.model.vllm_config
+        if config.engram_config and config.engram_config.use_thp:
+            # Loading weights refills the file cache; release it before MADV_COLLAPSE.
+            model_config = config.model_config
+            drop_checkpoint_cache(
+                model_config.model_weights or model_config.model,
+                revision=model_config.revision,
+                cache_dir=config.load_config.download_dir,
+            )
+            for layer in islice(
+                self.model.layers, self.model.start_layer, self.model.end_layer
+            ):
+                if layer.engram is not None:
+                    layer.engram.embed_tokens.collapse_huge_pages()
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
