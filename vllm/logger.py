@@ -20,10 +20,38 @@ import vllm.envs as envs
 from vllm.logging_utils import ColoredFormatter, NewLineFormatter
 
 _FORMAT = (
-    f"{envs.VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    f"{envs.VLLM_LOGGING_PREFIX}(%(vllm_process_name)s "
+    "pid=%(process)d) %(levelname)s %(asctime)s "
     "[%(fileinfo)s:%(lineno)d] %(message)s"
 )
 _DATE_FORMAT = "%m-%d %H:%M:%S"
+
+_base_log_record_factory = logging.getLogRecordFactory()
+_vllm_process_info: tuple[str, int] | None = None
+
+
+def _vllm_log_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    """Add vLLM process metadata to each log record."""
+    record = _base_log_record_factory(*args, **kwargs)
+    process_info = _vllm_process_info
+    pid = os.getpid()
+    if process_info is None or process_info[1] != pid:
+        record.vllm_process_name = record.processName
+    else:
+        record.vllm_process_name = process_info[0]
+    return record
+
+
+def set_vllm_process_name(process_name: str, *, skip_if_set: bool = False) -> None:
+    """Set the vLLM process name added to subsequent log records."""
+    global _vllm_process_info
+    pid = os.getpid()
+    if skip_if_set and _vllm_process_info is not None and _vllm_process_info[1] == pid:
+        return
+    _vllm_process_info = (process_name, pid)
+
+
+logging.setLogRecordFactory(_vllm_log_record_factory)
 
 
 def _use_color() -> bool:
