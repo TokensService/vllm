@@ -187,7 +187,7 @@ class CacheConfig:
       when the token is at position i * block_size. This is the default when prefix
       caching is enabled.
     """
-    enable_mamba_fine_grained_prefix_cache: bool = False
+    enable_mamba_shared_prefix_checkpoint: bool = False
     """Also register a Mamba "align" checkpoint at the shared-prefix junction --
     where an EAGLE/MTP sibling was observed to resume -- instead of only at the
     prompt tail. Off by default; only takes effect with `mamba_cache_mode`
@@ -291,6 +291,7 @@ class CacheConfig:
             "enable_mamba_fine_grained_prefix_cache",
             "enable_mamba_checkpoint",
             "mamba_checkpoint_token",
+            "enable_mamba_shared_prefix_checkpoint",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
