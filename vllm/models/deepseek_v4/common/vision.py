@@ -451,7 +451,11 @@ def run_dp_sharded_vision_tower(
     if local_embeds:
         embeds_local = torch.cat(local_embeds, dim=0)
     else:
-        embeds_local = patches.new_zeros((0, aligner.out_dim))
+        embeds_local = torch.zeros(
+            (0, aligner.out_dim),
+            device=patches.device,
+            dtype=next(aligner.parameters()).dtype,
+        )
     if embeds_local.shape[0] < max_rows:
         embeds_local = torch.cat(
             [
