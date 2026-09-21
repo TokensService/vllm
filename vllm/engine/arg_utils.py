@@ -753,8 +753,8 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    enable_mamba_fine_grained_prefix_cache: bool = (
-        CacheConfig.enable_mamba_fine_grained_prefix_cache
+    enable_mamba_shared_prefix_checkpoint: bool = (
+        CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
     enable_mamba_checkpoint: bool = CacheConfig.enable_mamba_checkpoint
     mamba_checkpoint_token: str | None = CacheConfig.mamba_checkpoint_token
@@ -1332,8 +1332,8 @@ class EngineArgs:
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
-            "--enable-mamba-fine-grained-prefix-cache",
-            **cache_kwargs["enable_mamba_fine_grained_prefix_cache"],
+            "--enable-mamba-shared-prefix-checkpoint",
+            **cache_kwargs["enable_mamba_shared_prefix_checkpoint"],
         )
         cache_group.add_argument(
             "--enable-mamba-checkpoint", **cache_kwargs["enable_mamba_checkpoint"]
@@ -2136,8 +2136,8 @@ class EngineArgs:
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
             mamba_cache_mode=self.mamba_cache_mode,
-            enable_mamba_fine_grained_prefix_cache=(
-                self.enable_mamba_fine_grained_prefix_cache
+            enable_mamba_shared_prefix_checkpoint=(
+                self.enable_mamba_shared_prefix_checkpoint
             ),
             enable_mamba_checkpoint=self.enable_mamba_checkpoint,
             mamba_checkpoint_token=self.mamba_checkpoint_token,
