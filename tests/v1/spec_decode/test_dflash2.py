@@ -10,6 +10,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     _add_global_draft_layer_exclusions,
 )
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
@@ -54,6 +55,54 @@ def test_draft_quant_exclusions_include_global_layer_indices():
     assert "*layers.92.self_attn.q_proj" in quant_config.exclude_modules
     assert quant_config.exclude_modules.count("layers.88.already_global") == 1
     assert "lilicorr.layers.88.mlp.0" not in quant_config.exclude_modules
+    
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "batch,num_groups,group_size,block_size,taps",
+    [
+        (7, 13, 11, 5, 1),
+        (7, 13, 11, 5, 3),
+        (7, 13, 11, 8, 2),
+        (16, 64, 16, 8, 2),
+        (16, 160, 16, 8, 2),
+    ],
+)
+def test_grouped_conv_triton_matches_reference(
+    dtype: torch.dtype,
+    batch: int,
+    num_groups: int,
+    group_size: int,
+    block_size: int,
+    taps: int,
+):
+    torch.manual_seed(0)
+    rows = batch * block_size
+    hidden = torch.randn(rows, num_groups * group_size, device="cuda", dtype=dtype)
+    base = torch.randn(taps, num_groups * group_size, device="cuda", dtype=dtype)
+    projected = torch.randn(rows, 2, taps, num_groups, device="cuda", dtype=dtype)
+    delta = projected[:, 1]
+
+    actual = _grouped_conv(
+        hidden, delta, base, block_size, num_groups, group_size, taps
+    )
+
+    hidden_blocks = hidden.float().view(batch, block_size, num_groups, group_size)
+    expected = torch.zeros_like(hidden_blocks)
+    base_blocks = base.float().view(taps, num_groups, group_size)
+    delta_blocks = delta.float().view(batch, block_size, taps, num_groups)
+    for position in range(block_size):
+        for tap in range(min(taps, position + 1)):
+            expected[:, position] += (
+                base_blocks[tap] + delta_blocks[:, position, tap, :, None]
+            ) * hidden_blocks[:, position - tap]
+
+    torch.testing.assert_close(
+        actual,
+        expected.flatten(0, 1).flatten(-2).to(dtype),
+        rtol=1e-2 if dtype is torch.bfloat16 else 1e-5,
+        atol=1e-2 if dtype is torch.bfloat16 else 1e-5,
+    )
 
 
 def test_selector_edges_match_sequential_reference():
