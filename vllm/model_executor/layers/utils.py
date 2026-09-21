@@ -265,8 +265,15 @@ def use_aiter_decode_gemm(n, m, k, dtype, bias):
     measurably faster. Rather than duplicate a shape table here, ask aiter:
     the tuned-config lookup answers only for shapes somebody actually tuned,
     and reports a different backend for everything else.
+
+    Gated on `is_linear_enabled` rather than `is_tgemm_enabled`: the latter is
+    additionally `and on_gfx950()`, which silently excluded gfx942 even once
+    tuned rows for it existed. No architecture check is needed here because the
+    tuned-config key carries `gfx` and `cu_num`, so a row only ever answers for
+    the card it was measured on. On gfx950 the condition is unchanged, since
+    `on_gfx950()` is true there anyway.
     """
-    if not rocm_aiter_ops.is_tgemm_enabled():
+    if not rocm_aiter_ops.is_linear_enabled():
         return False
     if dtype not in [torch.float16, torch.bfloat16]:
         return False
