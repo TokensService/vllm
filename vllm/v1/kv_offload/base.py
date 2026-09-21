@@ -16,7 +16,7 @@ if TYPE_CHECKING:
         OffloadingConnectorStats,
     )
 
-from vllm.v1.cache_hit_source import CacheHitSource
+from vllm.distributed.kv_transfer.kv_connector.cache_hit_source import CacheHitSource
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 # `OffloadKey` identifies an offloaded block. It combines a block hash with
