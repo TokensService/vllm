@@ -55,7 +55,8 @@ def test_draft_quant_exclusions_include_global_layer_indices():
     assert "*layers.92.self_attn.q_proj" in quant_config.exclude_modules
     assert quant_config.exclude_modules.count("layers.88.already_global") == 1
     assert "lilicorr.layers.88.mlp.0" not in quant_config.exclude_modules
-    
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
