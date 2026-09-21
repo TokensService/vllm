@@ -18,6 +18,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_transfer.kv_connector.cache_hit_source import CacheHitSource
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -902,6 +903,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 num_external_computed_tokens = 0
+                external_cached_sources: list[tuple[CacheHitSource, int]] | None = None
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
@@ -1012,14 +1014,6 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats and request.num_preemptions <= 0:
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed. A streaming-input
@@ -1232,6 +1226,28 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
+
+                # Attribute the first prefill after the connector builds its load plan.
+                if (
+                    did_prefix_cache_lookup
+                    and request.prefill_stats
+                    and request.num_preemptions <= 0
+                ):
+                    assert num_computed_tokens <= request.num_prompt_tokens
+                    if num_external_computed_tokens and isinstance(
+                        self.connector, KVConnectorBase_V1
+                    ):
+                        external_cached_sources = (
+                            self.connector.get_external_cache_hit_sources(
+                                request, num_external_computed_tokens
+                            )
+                        )
+                    request.prefill_stats.set(
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_new_local_computed_tokens,
+                        num_external_cached_tokens=num_external_computed_tokens,
+                        external_cached_sources=external_cached_sources,
+                    )
 
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
@@ -3165,6 +3181,18 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - req_num_computed_tokens
                     )
                     request.num_computed_tokens = req_num_computed_tokens
+
+                prefill_stats = request.prefill_stats
+                if prefill_stats is not None:
+                    valid_external_tokens = max(
+                        0,
+                        min(
+                            prefill_stats.num_external_cached_tokens,
+                            request.num_computed_tokens
+                            - prefill_stats.num_local_cached_tokens,
+                        ),
+                    )
+                    prefill_stats.truncate_external_cached_tokens(valid_external_tokens)
 
                 affected_req_ids.add(request.request_id)
 

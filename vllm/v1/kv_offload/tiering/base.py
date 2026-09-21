@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
+from vllm.distributed.kv_transfer.kv_connector.cache_hit_source import CacheHitSource
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -141,6 +142,8 @@ class SecondaryTierManager(ABC):
     """
 
     medium: ClassVar[Medium | None] = None
+    # Metric attribution is independent of the functional tier_type name.
+    cache_hit_source: ClassVar[CacheHitSource] = CacheHitSource.EXTERNAL_UNSPECIFIED
 
     def __init__(
         self,
