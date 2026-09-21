@@ -1968,9 +1968,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL", "0"))
     ),
-    # DeepEP v2: enable two-tier NVLink+RDMA hybrid mode
+    # Allow DeepEP v2 to select NVLink+RDMA hybrid communication across NVLink
+    # domains. Within one NVLink domain, DeepEP uses NVLink-only communication.
     "VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE": lambda: bool(
-        int(os.getenv("VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE", "0"))
+        int(os.getenv("VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE", "1"))
     ),
     # DeepEP v2: use fewer SMs at slight throughput cost
     "VLLM_DEEPEP_V2_PREFER_OVERLAP": lambda: bool(
