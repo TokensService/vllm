@@ -44,30 +44,28 @@ logger = init_logger(__name__)
 
 
 def get_draft_load_config(vllm_config: VllmConfig) -> LoadConfig:
-    """Get load config for the speculative draft model."""
+    """Load config for the speculative draft model.
+
+    An explicit ``draft_load_config`` always wins. Otherwise the draft inherits
+    the target's load config, except under ``ipc_cache``: a cached draft
+    (MTP, EAGLE, EAGLE3) is routed to the daemon's draft group, and any other
+    draft falls back to disk loading instead of being sent to the target
+    daemon with a mismatching fingerprint.
+    """
     speculative_config = vllm_config.speculative_config
-    if (
-        speculative_config is not None
-        and speculative_config.draft_load_config is not None
-    ):
-        return speculative_config.draft_load_config
+    assert speculative_config is not None
     load_config = vllm_config.load_config
-    if load_config is not None and load_config.load_format != "ipc_cache":
+    if speculative_config.draft_load_config is not None:
+        return speculative_config.draft_load_config
+    if load_config.load_format != "ipc_cache":
         return load_config
-    kwargs = (
-        # Route the draft to the daemon's draft group.
-        {
-            "model_loader_extra_config": {
-                **load_config.model_loader_extra_config,
-                "is_draft": True,
-            }
-        }
-        if is_draft_model_cacheable(speculative_config)
-        # No daemon draft group for this method; load from disk instead of
-        # hitting the target daemon with a mismatching fingerprint.
-        else {"load_format": "auto", "model_loader_extra_config": {}}
-    )
-    return replace(load_config, **kwargs)
+    if is_draft_model_cacheable(speculative_config):
+        return replace(
+            load_config,
+            weight_cache_is_draft_model=True,
+            weight_cache_draft_model_idx=0,
+        )
+    return replace(load_config, load_format="auto", model_loader_extra_config={})
 
 
 @instrument(span_name="Initialize model")
