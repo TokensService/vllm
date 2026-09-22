@@ -1971,6 +1971,9 @@ class rocm_aiter_ops:
 
     # Check if the env variable is set
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
+    _gdn_flydsl_prefill_import_error: str | None = None
+    # Chunk length the AITER FlyDSL K5 prefill kernels are compiled for.
+    GDN_FLYDSL_CHUNK_SIZE = 64
     _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
@@ -2403,6 +2406,29 @@ class rocm_aiter_ops:
         except (ImportError, ModuleNotFoundError):
             return False
 
+    @staticmethod
+    def _gdn_flydsl_prefill_kernels_importable() -> bool:
+        try:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (  # noqa: F401
+                chunk_gated_delta_rule_fwd_h_flydsl_opt,
+                gdn_prepare_flydsl_supported,
+                gdn_prepare_fwd_flydsl,
+            )
+            from aiter.ops.triton.gated_delta_net import (  # noqa: F401
+                build_gated_delta_rule_prefill_metadata,
+                chunk_gated_delta_rule_opt_vk,
+            )
+
+            rocm_aiter_ops._gdn_flydsl_prefill_import_error = None
+            return True
+        except (ImportError, ModuleNotFoundError) as e:
+            rocm_aiter_ops._gdn_flydsl_prefill_import_error = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "AITER FlyDSL GDN prefill kernels are not importable: %s",
+                rocm_aiter_ops._gdn_flydsl_prefill_import_error,
+            )
+            return False
+
     @classmethod
     @if_aiter_supported
     def are_gdn_triton_kernels_available(cls) -> bool:
@@ -2413,6 +2439,60 @@ class rocm_aiter_ops:
         in older aiter builds.
         """
         return cls._AITER_ENABLED and cls._gdn_triton_kernels_importable()
+
+    @classmethod
+    @functools.cache
+    def is_gdn_flydsl_prefill_available(cls) -> bool:
+        """Whether the opt-in AITER FlyDSL GDN prefill path can be used.
+
+        Selecting the backend is an explicit opt-in in itself, but it still
+        runs AITER kernels, so VLLM_ROCM_USE_AITER remains the one switch that
+        turns all of them off. Asking for the backend with AITER disabled is a
+        contradiction, and the caller reports it rather than quietly picking
+        one of the two answers.
+        """
+        return (
+            cls._AITER_ENABLED
+            and is_aiter_found_and_supported()
+            and cls._gdn_flydsl_prefill_kernels_importable()
+        )
+
+    @classmethod
+    def gdn_flydsl_prefill_unavailable_reason(cls) -> str:
+        """Human-readable reason the FlyDSL GDN prefill path cannot run."""
+        if not cls._AITER_ENABLED:
+            return "AITER is disabled; set VLLM_ROCM_USE_AITER=1 to enable it"
+        if not is_aiter_found_and_supported():
+            return "AITER is not installed or this GPU is not CDNA 3 or newer"
+        if cls._gdn_flydsl_prefill_import_error:
+            return cls._gdn_flydsl_prefill_import_error
+        if not cls._gdn_flydsl_prefill_kernels_importable():
+            return cls._gdn_flydsl_prefill_import_error or (
+                "AITER FlyDSL GDN prefill APIs are missing"
+            )
+        return "unknown"
+
+    @classmethod
+    def build_gdn_flydsl_prefill_metadata(
+        cls,
+        seq_lens_cpu: list[int],
+        cu_seqlens: torch.Tensor,
+    ) -> object:
+        """Build the reusable varlen metadata FlyDSL GDN prefill runs against.
+
+        The K5 recurrence is compiled for a fixed 64-token chunk, so the chunk
+        size is a property of the AITER kernel rather than of FLA, and is not
+        the caller's to choose.
+        """
+        from aiter.ops.triton.gated_delta_net import (
+            build_gated_delta_rule_prefill_metadata,
+        )
+
+        return build_gated_delta_rule_prefill_metadata(
+            seq_lens_cpu,
+            cu_seqlens=cu_seqlens,
+            chunk_size=cls.GDN_FLYDSL_CHUNK_SIZE,
+        )
 
     @classmethod
     def is_rdna_gdn_triton_kernels_available(cls) -> bool:
