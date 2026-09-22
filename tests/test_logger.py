@@ -9,6 +9,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from json.decoder import JSONDecodeError
+from logging.config import dictConfig
 from tempfile import NamedTemporaryFile
 from typing import Any
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from uuid import uuid4
 
 import pytest
 
+import vllm.logger as vllm_logger
 from vllm.logger import (
     _DATE_FORMAT,
     _FORMAT,
@@ -26,6 +28,7 @@ from vllm.logger import (
 )
 from vllm.logging_utils import NewLineFormatter
 from vllm.logging_utils.dump_input import prepare_object_to_dump
+from vllm.utils.system_utils import decorate_logs
 
 
 def f1(x):
@@ -72,6 +75,54 @@ def test_default_vllm_root_logger_configuration(monkeypatch):
     assert isinstance(formatter, NewLineFormatter)
     assert formatter._fmt == _FORMAT
     assert formatter.datefmt == _DATE_FORMAT
+
+
+def test_json_logging(monkeypatch):
+    output = io.StringIO()
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "json": {
+                "class": "pythonjsonlogger.jsonlogger.JsonFormatter",
+                "format": (
+                    "%(asctime)s %(levelname)s %(name)s %(vllm_process_name)s "
+                    "%(process)d %(message)s"
+                ),
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "json",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "vllm": {
+                "handlers": ["console"],
+                "level": "INFO",
+                "propagate": False,
+            },
+        },
+    }
+
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(sys, "stdout", output)
+            # Restore this module-global state when the context exits.
+            context.setattr(vllm_logger, "_vllm_process_info", None)
+            dictConfig(logging_config)
+            decorate_logs("Worker_DP0")
+            init_logger("vllm.structured_log_probe").info("structured log probe")
+
+            log = json.loads(output.getvalue())
+    finally:
+        _configure_vllm_root_logger()
+
+    assert log["message"] == "structured log probe"
+    assert log["vllm_process_name"] == "Worker_DP0"
+    assert log["process"] == os.getpid()
 
 
 def test_use_color_force_color(monkeypatch):
