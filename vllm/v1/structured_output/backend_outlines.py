@@ -130,6 +130,13 @@ class OutlinesGrammar(StructuredOutputGrammar):
         Returns True if the FSM was advanced successfully.
         Returns False if the FSM failed to advance.
         """
+        if self.guide.is_finished():
+            # Once the guide has reached an accept state it rejects every
+            # token, including the EOS its own bitmask still allows through.
+            # The sampler therefore emits EOS right after the match completes,
+            # so accept it without advancing (mirrors the xgrammar and
+            # guidance backends, which accept tokens after termination).
+            return True
         if self.guide.accepts_tokens(tokens):
             # Advance can fail when the next state reached after advancing with
             # the current tokens is a dead state. This is because Guide.accepts_tokens()
@@ -206,6 +213,14 @@ def validate_structured_output_request_outlines(params: SamplingParams):
         choices = [regex_escape(str(choice)) for choice in so_params.choice]
         regex = "(" + "|".join(choices) + ")"
         validate_regex_is_buildable(regex)
+    elif so_params.json_object:
+        # compile_grammar() has no JSON_OBJECT branch and raises ValueError
+        # there, which the server turns into a 500. Reject it here instead
+        # so the request fails fast with a 400.
+        raise VLLMValidationError(
+            "Outlines structured outputs backend "
+            "does not support json_object specifications"
+        )
     elif so_params.grammar:
         raise VLLMValidationError(
             "Outlines structured outputs backend "
