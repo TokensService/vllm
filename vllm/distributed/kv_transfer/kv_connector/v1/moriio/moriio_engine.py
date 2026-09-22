@@ -33,8 +33,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferError,
     TransferId,
     WriteTask,
+    fold_local_rank,
     get_port_offset,
     get_role,
+    pod_index,
     zmq_ctx,
 )
 
@@ -226,15 +228,6 @@ class MoRIIOWriter:
         for task in self._deferred_tasks:
             if self._is_transfer_terminal(task.transfer_id):
                 continue
-            if now - task.enqueue_time > defer_timeout:
-                logger.error(
-                    "Deferred write task for request %s expired after %.1fs "
-                    "(remote blocks never arrived), marking done",
-                    task.request_id,
-                    now - task.enqueue_time,
-                )
-                self._mark_request_done(task.transfer_id)
-                continue
             if self._is_remote_ready(task):
                 try:
                     self._execute_write_task(task)
@@ -244,10 +237,58 @@ class MoRIIOWriter:
                         task.request_id,
                     )
                     self._mark_request_done(task.transfer_id)
+            elif now - task.enqueue_time > defer_timeout:
+                if not self._fail_deferred_task(task, now - task.enqueue_time):
+                    still_deferred.append(task)
             else:
                 still_deferred.append(task)
 
         self._deferred_tasks = still_deferred
+
+    def _fail_deferred_task(self, task: WriteTask, age: float) -> bool:
+        """Fail a write before its source blocks are released."""
+        wrapper = self.worker.moriio_wrapper
+        with wrapper.lock:
+            if wrapper._is_transfer_terminal_locked(task.transfer_id):
+                return True
+            # The allocation can arrive between the ready check and this lock.
+            # Let the writer execute it on the next pass instead of racing a
+            # write_failed notification against write_done.
+            if task.transfer_id in wrapper.done_remote_allocate_req_dict:
+                return False
+            wrapper._mark_transfer_terminal_locked(task.transfer_id)
+        self._clear_transfer_state(task.transfer_id)
+
+        remote_ip, remote_port = self._resolve_notify_endpoint(
+            task.remote_ip,
+            task.remote_notify_port,
+            task.remote_dp_rank,
+        )
+        logger.error(
+            "Deferred write task for request %s timed out after %.1fs waiting "
+            "for remote blocks",
+            task.request_id,
+            age,
+        )
+        try:
+            wrapper.send_notify(
+                task.transfer_id,
+                remote_ip,
+                remote_port,
+                message_type="write_failed",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify consumer that transfer %s timed out",
+                task.transfer_id,
+            )
+            return True
+
+        # Release the producer blocks only after the transfer is terminal and
+        # the consumer failure has been sent.
+        with wrapper.lock:
+            wrapper.done_req_ids.append(MoRIIOTransferAck(task.transfer_id))
+        return True
 
     def _clear_transfer_state(self, transfer_id: TransferId) -> None:
         with self._write_state_lock:
@@ -315,17 +356,7 @@ class MoRIIOWriter:
         with self._write_state_lock:
             request_info.completion_request_id = task.request_id
             request_info.completion_remote_notify_port = task.remote_notify_port
-            # Wide-EP multi-pod: task.remote_ip addresses only the first pod,
-            # so resolve the per-rank host from multi_pod_hosts (falls back to
-            # task.remote_ip for single-pod or on any indexing miss).
-            _remote_ip = task.remote_ip
-            _hosts = list(getattr(self.worker, "multi_pod_hosts", []) or [])
-            _dp_local = int(getattr(self.worker, "remote_dp_size_local", 0) or 0)
-            if _hosts and _dp_local > 0:
-                _pod_idx = int(request_info.decode_dp_rank) // _dp_local
-                if 0 <= _pod_idx < len(_hosts):
-                    _remote_ip = _hosts[_pod_idx]
-            request_info.completion_remote_ip = _remote_ip
+            request_info.completion_remote_ip = task.remote_ip
             if task.transfer_id in self._sealed_writes:
                 request_info.writes_expected = self._sealed_writes[task.transfer_id]
 
@@ -472,15 +503,10 @@ class MoRIIOWriter:
         # Wait for this request's transfers to complete.
         self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)
 
-        # The notify port offset must use the per-pod local rank
-        # (% dp_local), since each pod binds notify sockets only for its local
-        # ranks. Single-pod is bit-identical (modulus is a no-op).
-        _dp_local = int(getattr(self.worker, "remote_dp_size_local", 0) or 0)
-        _decode_dp_rank_for_port = int(request_info.decode_dp_rank)
-        if _dp_local > 0:
-            _decode_dp_rank_for_port = _decode_dp_rank_for_port % _dp_local
-        remote_port = remote_notify_port + get_port_offset(
-            _decode_dp_rank_for_port, self.worker.tp_rank
+        remote_ip, remote_port = self._resolve_notify_endpoint(
+            remote_ip,
+            remote_notify_port,
+            request_info.decode_dp_rank,
         )
         # Consider using RDMA immediate data in decode side
         # to eliminate the need for this notification.
@@ -506,6 +532,22 @@ class MoRIIOWriter:
             transfer_id,
             remote_port,
         )
+
+    def _resolve_notify_endpoint(
+        self, remote_ip: str, remote_notify_port: int, decode_dp_rank: int
+    ) -> tuple[str, int]:
+        decode_dp_rank = int(decode_dp_rank)
+        dp_local = int(getattr(self.worker, "remote_dp_size_local", 0) or 0)
+        if dp_local > 0:
+            hosts = list(getattr(self.worker, "multi_pod_hosts", []) or [])
+            remote_pod = pod_index(decode_dp_rank, dp_local)
+            if 0 <= remote_pod < len(hosts):
+                remote_ip = hosts[remote_pod]
+        decode_dp_rank = fold_local_rank(decode_dp_rank, dp_local)
+        remote_port = remote_notify_port + get_port_offset(
+            decode_dp_rank, self.worker.tp_rank
+        )
+        return remote_ip, remote_port
 
 
 class MoRIIOWrapper:
@@ -540,6 +582,7 @@ class MoRIIOWrapper:
         self.done_req_ids: list[MoRIIOTransferAck] = []
         self.done_remote_allocate_req_dict: dict[TransferId, RemoteAllocInfo] = {}
         self.done_write_cache_req_ids: list[str] = []
+        self.failed_write_cache_req_ids: list[str] = []
         self._terminal_transfer_ids: OrderedDict[TransferId, None] = OrderedDict()
         self._transfer_timeout = transfer_timeout
         self.notify_thread: threading.Thread | None = None
@@ -804,6 +847,8 @@ class MoRIIOWrapper:
             self._handle_remote_blocks_message(data)
         elif message_type == "write_done":
             self._handle_write_done_message(data)
+        elif message_type == "write_failed":
+            self._handle_write_failed_message(data)
         elif message_type == "release":
             self._handle_release_message(data)
         else:
@@ -837,6 +882,12 @@ class MoRIIOWrapper:
         transfer_id = data["transfer_id"]
         with self.lock:
             self.done_write_cache_req_ids.append(transfer_id)
+
+    def _handle_write_failed_message(self, data: dict):
+        assert get_role() != ROLE.PRODUCER, "Only decode can get WRITE failure messages"
+        transfer_id = data["transfer_id"]
+        with self.lock:
+            self.failed_write_cache_req_ids.append(transfer_id)
 
     def _handle_release_message(self, data: dict):
         assert get_role() == ROLE.PRODUCER, (
@@ -929,6 +980,12 @@ class MoRIIOWrapper:
             done_write_cache = set(self.done_write_cache_req_ids)
             self.done_write_cache_req_ids = []
         return done_write_cache
+
+    def pop_failed_write_req_ids(self):
+        with self.lock:
+            failed_write_cache = set(self.failed_write_cache_req_ids)
+            self.failed_write_cache_req_ids = []
+        return failed_write_cache
 
     def shutdown(self):
         logger.debug("Closing MoRIIOWrapper and cleaning up ZMQ sockets")
