@@ -1090,6 +1090,14 @@ class VllmConfig:
 
     def _verify_aux_output_compatibility(self) -> None:
         """Reject configurations unsupported by enabled auxiliary outputs."""
+        if (
+            self.aux_output_config.enable_omit_prefix_routed_experts
+            and not self.aux_output_config.enable_return_routed_experts
+        ):
+            raise ValueError(
+                "--enable-omit-prefix-routed-experts requires "
+                "--enable-return-routed-experts."
+            )
         if not self.aux_output_config.enabled:
             return
         if not self.use_v2_model_runner:
@@ -1130,10 +1138,30 @@ class VllmConfig:
             kv_transfer_config is not None
             and kv_transfer_config.is_kv_transfer_instance
         ):
-            raise ValueError(
-                "--enable-return-routed-experts is incompatible with KV "
-                "connectors (PD disaggregation and KV cache offload)."
+            if not self.aux_output_config.enable_omit_prefix_routed_experts:
+                raise ValueError(
+                    "Routed-expert return is incompatible with KV connectors "
+                    "without prefix omit."
+                )
+            if self.max_concurrent_batches > 2:
+                raise ValueError(
+                    "Routed-expert KV offload supports at most two batches."
+                )
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
             )
+            from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+                KVConnectorBase_V1,
+            )
+
+            connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)
+            if not issubclass(
+                connector_cls, KVConnectorBase_V1
+            ) or not connector_cls.supports_external_lookup_bypass(kv_transfer_config):
+                raise ValueError(
+                    "Routed-expert KV offload requires same-engine store/load with "
+                    "external-lookup bypass support; PD is unsupported."
+                )
 
     def _verify_kv_transfer_compat(self) -> None:
         """Reject configurations that silently corrupt KV transfers."""
