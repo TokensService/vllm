@@ -11,6 +11,11 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 TOKEN_BLOCK = 16
 
 
+def _reinterpret_u64_as_i64(value: int) -> int:
+    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
 class PromptEmbedsState:
     """GPU-side state for user-provided prompt embeddings.
 
@@ -55,7 +60,7 @@ class PromptEmbedsState:
         if is_token_ids is not None:
             mask = async_tensor_h2d(is_token_ids, device=self.device, dtype=torch.uint8)
         self.gpu_tensors[new_req_data.req_id] = (embeds, mask)
-        self.embeds_ptrs.np[req_index] = embeds.data_ptr()
+        self.embeds_ptrs.np[req_index] = _reinterpret_u64_as_i64(embeds.data_ptr())
         self.mask_ptrs.np[req_index] = 0 if mask is None else mask.data_ptr()
         self.embeds_lens.np[req_index] = embeds.shape[0]
 
