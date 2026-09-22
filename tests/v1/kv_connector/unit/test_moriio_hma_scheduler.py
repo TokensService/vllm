@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 mori_available = importlib.util.find_spec("mori") is not None
 
@@ -44,6 +45,16 @@ MoRIIOMode = moriio_connector.MoRIIOMode
 moriio_common = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common"
 )
+ROLE = moriio_common.ROLE
+get_role = moriio_common.get_role
+set_role = moriio_common.set_role
+
+
+@pytest.fixture(autouse=True)
+def restore_moriio_role():
+    role = get_role()
+    yield
+    set_role(role)
 
 
 class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore[name-defined]
@@ -53,6 +64,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
     def __init__(self, **attrs):
         self._mamba_group_ids: list[int] = []
         self._attn_group_ids: list[int] = [0]
+        self._num_ssm_scratch_blocks = 0
         self._ssm_state_slots_are_positional = False
         self._is_hma_required = False
         self.kv_cache_config = SimpleNamespace(
@@ -110,22 +122,57 @@ def _gdn_split_info(conv_rows=3, key_dim=4, value_dim=8, dtype_size=2):
     )
 
 
-def _mamba_spec(num_states: int = 2):
+def _mamba_spec(
+    num_states: int = 2,
+    *,
+    block_size: int = 16,
+    num_speculative_blocks: int = 0,
+    mamba_cache_mode: str = "align",
+):
     shapes = tuple((1, 1) for _ in range(num_states))
     return moriio_connector.MambaSpec(
-        block_size=16,
+        block_size=block_size,
         shapes=shapes,
         dtypes=(torch.float32,) * num_states,
-        mamba_cache_mode="all",
+        mamba_cache_mode=mamba_cache_mode,
+        num_speculative_blocks=num_speculative_blocks,
     )
 
 
-def _gate_vllm_config(*, read_mode: bool = True, speculative_config=None):
+def _spec_config(method: str, *, is_dspark: bool):
+    return SimpleNamespace(method=method, use_dspark=lambda: is_dspark)
+
+
+def _gate_vllm_config(
+    *,
+    read_mode: bool = True,
+    speculative_config=None,
+    block_size: int = 16,
+    num_lookahead_tokens: int = 0,
+):
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={"read_mode": read_mode}
+            kv_connector_extra_config={
+                "read_mode": read_mode,
+                "host_ip": "127.0.0.1",
+                "handshake_port": 6001,
+                "notify_port": 6002,
+            },
+            kv_role="kv_consumer",
         ),
         speculative_config=speculative_config,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            mamba_cache_mode="align",
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        num_lookahead_tokens=num_lookahead_tokens,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_rank=0,
+            data_parallel_size_local=1,
+            data_parallel_size=1,
+        ),
     )
 
 
@@ -195,6 +242,17 @@ def test_exchange_blocks_ignore_transfer_disabled_group():
     ]
 
 
+def test_dspark_draft_group_stays_in_attention_split():
+    config = SimpleNamespace(
+        transfer_groups=(
+            SimpleNamespace(kv_cache_spec=object(), is_eagle_group=True),
+            SimpleNamespace(kv_cache_spec=_mamba_spec(), is_eagle_group=False),
+        )
+    )
+
+    assert moriio_connector._split_kv_cache_group_kinds(config) == ([0], [1])
+
+
 def test_scheduler_rejects_multiple_attention_groups_with_mamba():
     config = SimpleNamespace(
         kv_cache_groups=[
@@ -251,7 +309,7 @@ def test_scheduler_rejects_mamba_group_without_two_states():
         moriio_connector.MoRIIOConnectorScheduler(_gate_vllm_config(), "engine", config)
 
 
-def test_scheduler_rejects_speculative_hybrid_read():
+def test_scheduler_rejects_non_dspark_speculative_hybrid_read():
     config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=object()),
@@ -262,8 +320,55 @@ def test_scheduler_rejects_speculative_hybrid_read():
 
     with pytest.raises(moriio_common.MoRIIOError, match="speculative decoding"):
         moriio_connector.MoRIIOConnectorScheduler(
-            _gate_vllm_config(speculative_config=object()), "engine", config
+            _gate_vllm_config(
+                speculative_config=_spec_config("ngram", is_dspark=False)
+            ),
+            "engine",
+            config,
         )
+
+
+def test_scheduler_accepts_dspark_with_wrapped_full_attention():
+    full = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    wrapped_full = UniformTypeKVCacheSpecs(
+        block_size=4,
+        kv_cache_specs={"target": full, "draft": full},
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=wrapped_full),
+            SimpleNamespace(
+                enable_kv_transfer=True,
+                kv_cache_spec=_mamba_spec(
+                    block_size=4,
+                    num_speculative_blocks=2,
+                ),
+            ),
+        ],
+    )
+    config.transfer_groups = tuple(config.kv_cache_groups)
+
+    scheduler = moriio_connector.MoRIIOConnectorScheduler(
+        _gate_vllm_config(
+            speculative_config=_spec_config("dspark", is_dspark=True),
+            block_size=4,
+            num_lookahead_tokens=7,
+        ),
+        "engine",
+        config,
+    )
+
+    assert scheduler._attn_group_ids == [0]
+    assert scheduler._mamba_group_ids == [1]
+    assert scheduler._num_ssm_scratch_blocks == 2
+    assert scheduler._max_decode_tail_blocks == 2
+    assert scheduler._is_hma_required
+    assert scheduler._full_attn_group_idx == 0
 
 
 def test_scheduler_rejects_hybrid_write():
@@ -314,6 +419,42 @@ def test_split_block_groups_keeps_only_running_state_outside_all_mode():
         _mamba_group_ids=[1],
     )
     assert sched.split_block_groups(([1], [40, 41])) == ([1], [[41]])
+
+
+def test_split_block_groups_drops_dspark_scratch_slots():
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids=[0],
+        _mamba_group_ids=[1],
+        _num_ssm_scratch_blocks=2,
+        _ssm_state_slots_are_positional=True,
+    )
+
+    assert sched.split_block_groups(([1], [40, 41, 42])) == ([1], [[40]])
+
+
+def test_split_block_groups_drops_scratch_before_selecting_running_state():
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids=[0],
+        _mamba_group_ids=[1],
+        _num_ssm_scratch_blocks=2,
+        _ssm_state_slots_are_positional=False,
+    )
+
+    assert sched.split_block_groups(([1], [40, 41, 42, 43])) == ([1], [[41]])
+
+
+def test_split_block_groups_keeps_one_state_for_short_scratch_list():
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids=[0],
+        _mamba_group_ids=[1],
+        _num_ssm_scratch_blocks=2,
+        _ssm_state_slots_are_positional=True,
+    )
+
+    assert sched.split_block_groups(([1], [40])) == ([1], [[40]])
 
 
 # --------------------------------------------------------------------------
