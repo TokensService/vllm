@@ -4383,3 +4383,59 @@ def test_trailing_layer_fallback_requires_exact_partition():
     _annotate_eagle_groups(config, specs, trimmed, use_trailing_layer_fallback=True)
 
     assert not any(g.is_eagle_group for g in trimmed)
+
+
+def test_get_kv_cache_config_glm5_with_dflash_draft_group():
+    """A plain-attention draft (DFlash) attached to GLM-5.3-Flash joins the
+    target's attention group: SWA draft specs are promoted to full-attention
+    allocation at the MLA block size (keeping the window for compute), the
+    group stays uniform, and draft pages land in a layer-outermost region
+    past the target slots inside every block."""
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    kv_cache_spec, _ = _glm5_like_kv_cache_spec()
+    for i in range(5):
+        kv_cache_spec[f"draft.layers.{i}.attn"] = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=2048,
+        )
+    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+    idx_page = kv_cache_spec["layers.3.indexer"].page_size_bytes
+    mla_block_size = kv_cache_spec["layers.3.attn"].block_size
+    draft_page = 2 * 8 * 128 * 2 * mla_block_size
+
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    uniform_groups = [
+        g for g in groups if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    assert len(groups) == 5
+    assert len(uniform_groups) == 1
+    attn_specs = uniform_groups[0].kv_cache_spec.kv_cache_specs
+    promoted = attn_specs["draft.layers.0.attn"]
+    assert type(promoted) is FullAttentionSpec
+    assert promoted.sliding_window == 2048
+    assert promoted.block_size == mla_block_size
+    assert promoted.page_size_bytes == draft_page
+
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+    assert layout is not None
+    assert layout[8] == [f"draft.layers.{i}.attn" for i in range(5)]
+
+    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+    assert bytes_per_block == 11 * mla_page + 11 * idx_page + 5 * draft_page
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * 100 + 1
+    )
+    assert kv_cache_config.num_blocks == 100
+    tensors = _tensor_by_layer(kv_cache_config)
+    target_region = (11 * mla_page + 11 * idx_page) * 100
+    for i in range(5):
+        t = tensors[f"draft.layers.{i}.attn"]
+        assert t.block_stride == draft_page
+        assert t.offset == target_region + i * draft_page * 100
+    assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
