@@ -1144,6 +1144,28 @@ class SamplingParams(
             raise VLLMValidationError(
                 "structured_outputs.regex must not contain a NUL character ('\\x00')"
             )
+        # Reject empty string regex early. xgrammar tolerates compile_regex("")
+        # without crashing, but an empty regex provides no constraint and is a
+        # degenerate request; reject at the API layer for consistency with the
+        # json/grammar guards above.
+        if (
+            isinstance(self.structured_outputs.regex, str)
+            and self.structured_outputs.regex.strip() == ""
+        ):
+            raise VLLMValidationError(
+                "structured_outputs.regex cannot be an empty string"
+            )
+        # Reject empty string structural_tag early: it passes the `is not None`
+        # exclusivity check and would otherwise reach json.loads("") inside
+        # compile_grammar and raise JSONDecodeError, surfacing as a per-request
+        # engine error instead of a clean 400 at request validation.
+        if (
+            isinstance(self.structured_outputs.structural_tag, str)
+            and self.structured_outputs.structural_tag.strip() == ""
+        ):
+            raise VLLMValidationError(
+                "structured_outputs.structural_tag cannot be an empty string"
+            )
 
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,
