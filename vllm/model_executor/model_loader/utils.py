@@ -29,6 +29,9 @@ from vllm.model_executor.model_loader.reload import (
     record_metadata_for_reloading,
     set_torchao_reload_attrs,
 )
+from vllm.model_executor.model_loader.weight_cache.utils import (
+    is_draft_model_cacheable,
+)
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
 from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm.model_executor.utils import is_weights_pre_processed
@@ -49,10 +52,6 @@ def get_draft_load_config(vllm_config: VllmConfig) -> LoadConfig:
     draft falls back to disk loading instead of being sent to the target
     daemon with a mismatching fingerprint.
     """
-    from vllm.model_executor.model_loader.weight_cache.protocol import (
-        caches_draft_model,
-    )
-
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     load_config = vllm_config.load_config
@@ -60,7 +59,7 @@ def get_draft_load_config(vllm_config: VllmConfig) -> LoadConfig:
         return speculative_config.draft_load_config
     if load_config.load_format != "ipc_cache":
         return load_config
-    if caches_draft_model(speculative_config):
+    if is_draft_model_cacheable(speculative_config):
         return replace(
             load_config,
             weight_cache_is_draft_model=True,

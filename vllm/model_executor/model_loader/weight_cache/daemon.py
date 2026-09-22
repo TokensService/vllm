@@ -466,28 +466,7 @@ def get_draft_daemon_config(
     speculative_config = vllm_config.speculative_config
     if not caches_draft_model(speculative_config):
         return None
-    if speculative_config.moe_backend is not None:
-        vllm_config = replace(
-            vllm_config,
-            kernel_config=replace(
-                vllm_config.kernel_config, moe_backend=speculative_config.moe_backend
-            ),
-        )
-    if speculative_config.attention_backend is not None:
-        vllm_config = replace(
-            vllm_config,
-            attention_config=replace(
-                vllm_config.attention_config,
-                backend=speculative_config.attention_backend,
-            ),
-        )
-    if speculative_config.kv_cache_dtype is not None:
-        vllm_config = replace(
-            vllm_config,
-            cache_config=replace(
-                vllm_config.cache_config, cache_dtype=speculative_config.kv_cache_dtype
-            ),
-        )
+    vllm_config = speculative_config.apply_draft_overrides(vllm_config)
     return vllm_config, speculative_config.draft_model_config
 
 
@@ -585,7 +564,6 @@ def main() -> None:
     master_port = args.weight_cache_master_port or get_open_port()
     distributed_init_method = get_distributed_init_method(master_addr, master_port)
 
-    # (is_draft_model, draft_model_idx, config, rendezvous) per daemon group.
     # (is_draft_model, draft_model_idx, vllm_config, model_config, rendezvous)
     # per daemon group; model_config is None for the target.
     groups: list[tuple[bool, int | None, VllmConfig, ModelConfig | None, str]] = [
