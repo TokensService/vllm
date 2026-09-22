@@ -722,7 +722,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                weight_loader = _get_weight_loader(param)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1084,7 +1085,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                weight_loader = _get_weight_loader(param)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
 
@@ -1258,7 +1260,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                weight_loader = _get_weight_loader(param)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
