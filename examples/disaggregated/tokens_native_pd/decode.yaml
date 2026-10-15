@@ -1,0 +1,34 @@
+# Decode role of the Tokens native P/D deployment (GLM-5.2 NVFP4, TP x DP over
+# Ray, MooncakeConnector as kv_consumer). Feed to `vllm serve --config decode.yaml`.
+# Required process env (not expressible in this file):
+#   VLLM_PLUGINS=""                            # disable entry-point plugins
+#   RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+# The Decode pod also mounts the MoERunner fix files (vllm_native_moefix.py /
+# zz_vllm_native_moefix.pth) into dist-packages; see README.md.
+# CLI flags still win over values here (cli > config > defaults).
+model: /home/service/works/models_ssd/GLM-5.2-NVFP4-W4A4C8-MG40-BNT3/v1
+served-model-name: GLM-5.2-NVFP4-W4A4C8-MG40-BNT3
+host: 0.0.0.0
+port: 8020
+tensor-parallel-size: 1
+data-parallel-size: 4
+data-parallel-backend: ray
+distributed-executor-backend: mp
+block-size: 64
+max-model-len: 1048576
+max-num-seqs: 32
+max-num-batched-tokens: 128
+gpu-memory-utilization: 0.94
+enable-prefix-caching: true
+kv-cache-dtype: fp8
+async-scheduling: true
+speculative-config:
+  method: mtp
+  num_speculative_tokens: 3
+compilation-config:
+  cudagraph_mode: NONE
+kernel-config:
+  enable_flashinfer_autotune: false
+kv-transfer-config:
+  kv_connector: MooncakeConnector
+  kv_role: kv_consumer
