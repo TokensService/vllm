@@ -134,8 +134,13 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
       block-size: 64
       max-model-len: 1048576
+      gpu-memory-utilization: 0.9
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # MTP：prefill 侧用 1 个 draft token（与 SGLang PD 配方一致）
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 1
       # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
       kernel-config:
         enable_flashinfer_autotune: false
@@ -163,8 +168,13 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       max-model-len: 1048576
       max-num-seqs: 32
       max-num-batched-tokens: 128
+      gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # MTP：decode 侧用 3 个 draft token
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
       compilation-config:
         cudagraph_mode: FULL_DECODE_ONLY
       kernel-config:
@@ -190,8 +200,13 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       distributed-executor-backend: mp
       block-size: 64
       max-model-len: 1048576
+      gpu-memory-utilization: 0.9
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # MTP：standalone 按 decode 口径开 3
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
       kernel-config:
         enable_flashinfer_autotune: false
       tool-call-parser: glm47
