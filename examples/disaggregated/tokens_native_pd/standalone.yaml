@@ -1,0 +1,29 @@
+# Standalone baseline of the Tokens native deployment: a single Prefill-shaped
+# instance serving directly, without Mooncake / P/D disaggregation.
+# Feed to `vllm serve --config standalone.yaml`.
+# Required process env (not expressible in this file):
+#   VLLM_PLUGINS=""                            # disable entry-point plugins
+#   VLLM_PP_LAYER_PARTITION=22,20,20,16        # must have pipeline-parallel-size entries
+#   XCCL_TURBO_PREFILL_MLA_HEAD_PADDING=64
+# CLI flags still win over values here (cli > config > defaults).
+model: /home/service/works/models_ssd/GLM-5.2-NVFP4-W4A4C8-MG40-BNT3/v1
+served-model-name: GLM-5.2-NVFP4-W4A4C8-MG40-BNT3
+host: 0.0.0.0
+port: 8000
+tensor-parallel-size: 1
+pipeline-parallel-size: 4
+distributed-executor-backend: mp
+block-size: 64
+max-model-len: 1048576
+max-num-seqs: 8
+max-num-batched-tokens: 32768
+gpu-memory-utilization: 0.90
+enable-prefix-caching: true
+kv-cache-dtype: fp8
+speculative-config:
+  method: mtp
+  num_speculative_tokens: 3
+compilation-config:
+  cudagraph_mode: NONE
+kernel-config:
+  enable_flashinfer_autotune: false
