@@ -1,45 +1,59 @@
 # Tokens Native P/D Deployment (MooncakeConnector)
 
-Serve configs for the Tokens native disaggregated prefill/decode deployment of
-`GLM-5.2-NVFP4-W4A4C8-MG40-BNT3`, expressed as `vllm serve --config` YAML files
-(see `FlexibleArgumentParser` in `vllm/utils/argparse_utils.py`; precedence is
-CLI > config file > defaults, so any value here can be overridden per launch).
+Deployment strategy registry for Tokens vLLM serving. All strategies live in
+a single file, `model_arch.yaml`, keyed by `arch_name`.
 
-## Files
+## Naming rule
 
-- `prefill.yaml` — Prefill role, TP1 x PP4, `MooncakeConnector` as `kv_producer`,
-  listens on `:8010`.
-- `decode.yaml` — Decode role, TP1 x DP4 over Ray, `MooncakeConnector` as
-  `kv_consumer`, listens on `:8020`.
-- `standalone.yaml` — single-instance baseline (Prefill shape, no
-  `kv-transfer-config`), serving directly on `:8000`.
+```text
+<model>-<quant>-<platform>-<topology>
+```
+
+e.g. `GLM-5.2-W4A4C8-EMS-3P1D` = GLM-5.2 model, W4A4C8 quantization, EMS
+platform, 3 Prefill + 1 Decode instances. The topology suffix is `<n>P<m>D`
+for disaggregated strategies, `<n>P` for standalone-only ones.
+
+Currently registered:
+
+- `GLM-5.2-W4A4C8-MG40-BNT3-1P1D` — GLM-5.2 NVFP4 on MG40-BNT3: 1 Prefill
+  pod (TP1 x PP4, :8010) + 1 Decode pod (TP1 x DP4 over Ray, :8020), KV
+  transfer over MooncakeConnector, plus a `standalone` single-instance
+  baseline mode (:8000).
+
+## Strategy layout
+
+Each strategy holds per-role sections (`prefill` / `decode` / `standalone`):
+
+- `engine` — engine arguments compatible with `vllm serve --config`
+  (precedence is CLI > config file > defaults, so any value can be
+  overridden per launch);
+- `env` — process environment variables, which `--config` does not cover.
 
 ## Usage
 
+Extract one role with `render_serve_config.py`, which turns the role's
+`engine` section into a `--config`-ready YAML and its `env` section into
+shell exports:
+
 ```bash
 # Prefill (PD mode)
-VLLM_PLUGINS="" VLLM_PP_LAYER_PARTITION=22,20,20,16 \
-XCCL_TURBO_PREFILL_MLA_HEAD_PADDING=64 VLLM_MOONCAKE_BOOTSTRAP_PORT=8998 \
-  vllm serve --config prefill.yaml
+eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D prefill --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D prefill)
 
 # Decode (PD mode)
-VLLM_PLUGINS="" RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 \
-  vllm serve --config decode.yaml
+eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D decode --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D decode)
 
 # Standalone baseline
-VLLM_PLUGINS="" VLLM_PP_LAYER_PARTITION=22,20,20,16 \
-XCCL_TURBO_PREFILL_MLA_HEAD_PADDING=64 \
-  vllm serve --config standalone.yaml
+eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D standalone --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D standalone)
 ```
 
-## What is intentionally not in these files
+## What is intentionally not in model_arch.yaml
 
-`--config` covers CLI/engine arguments only. The rest of the deployment stays
-in the orchestration layer:
+Only per-process engine args and env belong to a strategy. The rest of the
+deployment stays in the orchestration layer:
 
-- Process env vars: `VLLM_PLUGINS`, `VLLM_PP_LAYER_PARTITION`,
-  `XCCL_TURBO_PREFILL_MLA_HEAD_PADDING`, `VLLM_MOONCAKE_BOOTSTRAP_PORT`,
-  `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES` (listed above per role).
 - Kubernetes Pod spec: namespace, node pinning, GPU limits, image,
   `runtimeClassName`, `hostNetwork`, `/dev/infiniband` and `/dev/shm` volumes.
 - Decode-only MoERunner fix files (`vllm_native_moefix.py` /
@@ -51,8 +65,8 @@ in the orchestration layer:
 
 The same recipe is embedded as generated Pod specs in the tokens-worktable
 pipeline scripts (`TokensService/tokens-worktable`,
-`projects/pipeline/scripts/vllm-native-*.sh`); keep those and these files in
-sync when tuning the deployment.
+`projects/pipeline/scripts/vllm-native-*.sh`); keep those and this registry
+in sync when tuning the deployment.
 
 ## Verifying the PD path
 
