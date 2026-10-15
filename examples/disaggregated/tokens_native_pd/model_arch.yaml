@@ -123,6 +123,8 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       VLLM_PP_LAYER_PARTITION: "22,20,20,16"
       VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
       model: /mnt/paas/GLM-5.3-NVFP4-W4A4-MG42-BNT3/v1
       served-model-name: GLM-5.3-W4A4C8-MG42-BNT3-1P1D
@@ -153,6 +155,8 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
   decode:
     env:
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
       model: /mnt/paas/GLM-5.3-NVFP4-W4A4-MG42-BNT3/v1
       served-model-name: GLM-5.3-W4A4C8-MG42-BNT3-1P1D
