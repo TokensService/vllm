@@ -227,8 +227,10 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D-6G:
   description: "GLM-5.3 W4A4C8 MG42 BNT3：1P(tp1×pp2)+1D(tp1×dp4)，共 6 卡（P 每卡约半模型权重，显存很紧）"
   prefill:
     env:
-      # 78 层按 PP4 切分（不指定时 vLLM 默认切 19/20/20/19）
-      VLLM_PP_LAYER_PARTITION: "38,40"
+      # 78 层按 PP2 切分：最后一段必须更少（末尾 rank 额外背 lm_head）。实测 "38,40" 时 PP1
+      # 权重 244GiB + 图 5.4GiB 超过 0.94 预算(240.6GiB) → 分不出 KV block、引擎启动失败；
+      # "42,36" 实测两 rank 217/222GiB，KV 19.9GiB / 689k tokens（2026-10-16 实测）
+      VLLM_PP_LAYER_PARTITION: "42,36"
       VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
       # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
