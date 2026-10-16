@@ -139,10 +139,17 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       gpu-memory-utilization: 0.9
       enable-prefix-caching: true
       kv-cache-dtype: fp8
-      # MTP：prefill 侧用 1 个 draft token（与 SGLang PD 配方一致）
-      speculative-config:
-        method: mtp
-        num_speculative_tokens: 1
+      # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
+      #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
+      #               is not supported for this model）
+      #   vLLM 0.31 —— 配置/权重/CUDA 图都过，但 PP warmup 阶段死锁（4 个 PP rank
+      #               注册 KV 后卡在 PP 组 broadcast 的 P2P 链，GPU 空闲；实测）
+      #   vLLM 0.30 —— 该组合可用（P mtp1 + PP4 已跑通 1174 请求）
+      # 注：num_speculative_tokens: 0 不被接受（SpeculativeConfig pydantic 校验失败），
+      #     故用"省略该键"表达关闭；确认支持的版本要开就把下面三行加回：
+      # speculative-config:
+      #   method: mtp
+      #   num_speculative_tokens: 1
       # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
       kernel-config:
         enable_flashinfer_autotune: false
