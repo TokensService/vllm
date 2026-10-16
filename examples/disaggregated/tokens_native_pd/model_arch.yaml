@@ -363,6 +363,8 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # P 侧开 enforce-eager：跳过 CUDA graph 捕获/编译，先保证能拉起
+      enforce-eager: true
       # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
       #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
       #               is not supported for this model）
@@ -374,9 +376,9 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       # speculative-config:
       #   method: mtp
       #   num_speculative_tokens: 1
-      # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
+      # flashinfer autotune 打开（性能调优阶段；P 侧同时开 enforce-eager）
       kernel-config:
-        enable_flashinfer_autotune: false
+        enable_flashinfer_autotune: true
       kv-transfer-config:
         kv_connector: MooncakeConnector
         kv_role: kv_producer
@@ -412,7 +414,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       compilation-config:
         cudagraph_mode: FULL_DECODE_ONLY
       kernel-config:
-        enable_flashinfer_autotune: false
+        enable_flashinfer_autotune: true
       kv-transfer-config:
         kv_connector: MooncakeConnector
         kv_role: kv_consumer
