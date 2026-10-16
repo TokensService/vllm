@@ -223,3 +223,111 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       tool-call-parser: glm47
       reasoning-parser: glm47
       enable-auto-tool-choice: true
+GLM-5.3-W4A4C8-MG42-BNT3-1P1D-6G:
+  description: "GLM-5.3 W4A4C8 MG42 BNT3：1P(tp1×pp2)+1D(tp1×dp4)，共 6 卡（P 每卡约半模型权重，显存很紧）"
+  prefill:
+    env:
+      # 78 层按 PP4 切分（不指定时 vLLM 默认切 19/20/20/19）
+      VLLM_PP_LAYER_PARTITION: "38,40"
+      VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+    engine:
+      model: /mnt/paas/GLM-5.3-NVFP4-W4A4-MG42-BNT3/v1
+      served-model-name: GLM-5.3-W4A4C8-MG42-BNT3-1P1D
+      host: 0.0.0.0
+      port: 8010
+      tensor-parallel-size: 1
+      pipeline-parallel-size: 2
+      distributed-executor-backend: mp
+      # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
+      block-size: 64
+      max-model-len: 524288
+      gpu-memory-utilization: 0.94
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
+      #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
+      #               is not supported for this model）
+      #   vLLM 0.31 —— 配置/权重/CUDA 图都过，但 PP warmup 阶段死锁（4 个 PP rank
+      #               注册 KV 后卡在 PP 组 broadcast 的 P2P 链，GPU 空闲；实测）
+      #   vLLM 0.30 —— 该组合可用（P mtp1 + PP4 已跑通 1174 请求）
+      # 注：num_speculative_tokens: 0 不被接受（SpeculativeConfig pydantic 校验失败），
+      #     故用"省略该键"表达关闭；确认支持的版本要开就把下面三行加回：
+      # speculative-config:
+      #   method: mtp
+      #   num_speculative_tokens: 1
+      # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
+      kernel-config:
+        enable_flashinfer_autotune: false
+      kv-transfer-config:
+        kv_connector: MooncakeConnector
+        kv_role: kv_producer
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
+  decode:
+    env:
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+    engine:
+      model: /mnt/paas/GLM-5.3-NVFP4-W4A4-MG42-BNT3/v1
+      served-model-name: GLM-5.3-W4A4C8-MG42-BNT3-1P1D
+      host: 0.0.0.0
+      port: 8020
+      tensor-parallel-size: 1
+      data-parallel-size: 4
+      # 单机形态：本地 DP（无 Ray）；多机时改小 data-parallel-size-local
+      data-parallel-backend: mp
+      data-parallel-size-local: 4
+      distributed-executor-backend: mp
+      block-size: 64
+      max-model-len: 1048576
+      max-num-seqs: 32
+      max-num-batched-tokens: 128
+      gpu-memory-utilization: 0.94
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # MTP：decode 侧用 3 个 draft token
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
+      compilation-config:
+        cudagraph_mode: FULL_DECODE_ONLY
+      kernel-config:
+        enable_flashinfer_autotune: false
+      kv-transfer-config:
+        kv_connector: MooncakeConnector
+        kv_role: kv_consumer
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
+  # 非 P/D 基线：单个 Prefill 形态实例直服（对照/排障用）
+  standalone:
+    env:
+      VLLM_PP_LAYER_PARTITION: "22,20,20,16"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    engine:
+      model: /mnt/paas/GLM-5.3-NVFP4-W4A4-MG42-BNT3/v1
+      served-model-name: GLM-5.3-W4A4C8-MG42-BNT3-1P1D
+      host: 0.0.0.0
+      port: 8000
+      tensor-parallel-size: 1
+      pipeline-parallel-size: 4
+      distributed-executor-backend: mp
+      block-size: 64
+      max-model-len: 1048576
+      gpu-memory-utilization: 0.9
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # MTP：standalone 按 decode 口径开 3
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
+      kernel-config:
+        enable_flashinfer_autotune: false
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
