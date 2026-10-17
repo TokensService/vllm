@@ -560,3 +560,120 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-8G:
       tool-call-parser: glm47
       reasoning-parser: glm47
       enable-auto-tool-choice: true
+
+GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-PP2TP2-8G:
+  description: >-
+    GLM-5.3 NVIDIA 原生 NVFP4 在单机 8×H800 上：1 个 Prefill 实例（TP2 x PP2，
+    :8010）+ 1 个 Decode 实例（TP1 x DP4，:8020），合计 8 卡，KV 经
+    MooncakeConnector 走 RDMA(RoCE) 传输；由 vllm-router 对外提供 :8000。本策略
+    不写死权重路径（engine 不含 model），部署时由编排层 / 命令行以 --model 指定。
+  prefill:
+    env:
+      # 78 层按 PP2 切分 "38,40"（末尾 rank 额外背 lm_head）。注意：该分段对较重的
+      # W4A4C8-MG42-BNT3 权重不成立 —— 实测 PP1 权重 244GiB 超过 0.94 预算(240.6GiB)，
+      # 分不出 KV block、引擎启动失败；那种权重请用 "42,36"（见上方 6G 策略）
+      # 注：以上显存实测均为 TP1 口径；本策略 P 侧 TP2（权重按 TP 切分到 2 卡），
+      # 单卡权重占用约为 TP1 的一半，38,40 是否够用需在本形态实测确认
+      VLLM_PP_LAYER_PARTITION: "38,40"
+      VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+    engine:
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-PP2TP2-8G
+      host: 0.0.0.0
+      port: 8010
+      tensor-parallel-size: 2
+      pipeline-parallel-size: 2
+      distributed-executor-backend: mp
+      # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
+      block-size: 64
+      max-model-len: 524288
+      gpu-memory-utilization: 0.94
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # P 侧开 enforce-eager：跳过 CUDA graph 捕获/编译
+      enforce-eager: true
+      # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
+      #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
+      #               is not supported for this model）
+      #   vLLM 0.31 —— 配置/权重/CUDA 图都过，但 PP warmup 阶段死锁（4 个 PP rank
+      #               注册 KV 后卡在 PP 组 broadcast 的 P2P 链，GPU 空闲；实测）
+      #   vLLM 0.30 —— 该组合可用（P mtp1 + PP4 已跑通 1174 请求）
+      # 注：num_speculative_tokens: 0 不被接受（SpeculativeConfig pydantic 校验失败），
+      #     故用"省略该键"表达关闭；确认支持的版本要开就把下面三行加回：
+      # speculative-config:
+      #   method: mtp
+      #   num_speculative_tokens: 1
+      # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
+      kernel-config:
+        enable_flashinfer_autotune: false
+      kv-transfer-config:
+        kv_connector: MooncakeConnector
+        kv_role: kv_producer
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
+  decode:
+    env:
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+    engine:
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-PP2TP2-8G
+      host: 0.0.0.0
+      port: 8020
+      tensor-parallel-size: 1
+      data-parallel-size: 4
+      # 单机形态：本地 DP（无 Ray）；多机时改小 data-parallel-size-local
+      data-parallel-backend: mp
+      data-parallel-size-local: 4
+      distributed-executor-backend: mp
+      block-size: 64
+      max-model-len: 1048576
+      max-num-seqs: 32
+      max-num-batched-tokens: 128
+      gpu-memory-utilization: 0.94
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # MTP：decode 侧用 3 个 draft token
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
+      compilation-config:
+        cudagraph_mode: FULL_DECODE_ONLY
+      kernel-config:
+        enable_flashinfer_autotune: false
+      kv-transfer-config:
+        kv_connector: MooncakeConnector
+        kv_role: kv_consumer
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
+  # 非 P/D 基线：单个 Prefill 形态实例直服（对照/排障用）
+  standalone:
+    env:
+      VLLM_PP_LAYER_PARTITION: "22,20,20,16"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    engine:
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-PP2TP2-8G
+      host: 0.0.0.0
+      port: 8000
+      tensor-parallel-size: 1
+      pipeline-parallel-size: 4
+      distributed-executor-backend: mp
+      block-size: 64
+      max-model-len: 1048576
+      gpu-memory-utilization: 0.9
+      enable-prefix-caching: true
+      kv-cache-dtype: fp8
+      # MTP：standalone 按 decode 口径开 3
+      speculative-config:
+        method: mtp
+        num_speculative_tokens: 3
+      kernel-config:
+        enable_flashinfer_autotune: false
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
+
