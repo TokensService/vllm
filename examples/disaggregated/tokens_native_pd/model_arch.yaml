@@ -342,10 +342,11 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
     （engine 不含 model），部署时由编排层 / 命令行以 --model 指定。
   prefill:
     env:
-      # 78 层按 PP2 切分 "38,40"（末尾 rank 额外背 lm_head）。注意：该分段对较重的
-      # W4A4C8-MG42-BNT3 权重不成立 —— 实测 PP1 权重 244GiB 超过 0.94 预算(240.6GiB)，
-      # 分不出 KV block、引擎启动失败；那种权重请用 "42,36"（见上方 6G 策略）
-      VLLM_PP_LAYER_PARTITION: "38,40"
+      # 78 层按 PP2 切分 "40,38"（末尾 rank 额外背 lm_head，故尾段少分 2 层）。注意：该
+      # 分段对较重的 W4A4C8-MG42-BNT3 权重不成立 —— 实测（38,40 形态）PP1 权重 244GiB
+      # 超过 0.94 预算(240.6GiB)，分不出 KV block、引擎启动失败；那种权重用 "42,36"
+      # （见上方 GLM-5.3-W4A4C8-MG42-BNT3-1P1D-6G）
+      VLLM_PP_LAYER_PARTITION: "40,38"
       VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
       # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
