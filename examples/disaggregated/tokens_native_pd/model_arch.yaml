@@ -363,6 +363,8 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # P 侧开 enforce-eager：跳过 CUDA graph 捕获/编译
+      enforce-eager: true
       # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
       #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
       #               is not supported for this model）
