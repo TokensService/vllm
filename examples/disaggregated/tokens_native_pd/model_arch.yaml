@@ -137,6 +137,8 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
       gpu-memory-utilization: 0.9
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # prefill 强制 eager：不走分段 CUDA graph
+      enforce-eager: true
       # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
       kernel-config:
         enable_flashinfer_autotune: false
