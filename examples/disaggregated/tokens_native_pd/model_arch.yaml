@@ -360,7 +360,6 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       distributed-executor-backend: mp
       # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
       block-size: 64
-      max-model-len: 524288
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
