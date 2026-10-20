@@ -133,12 +133,6 @@ GLM-5.2-W4A4C8-MG40-PP4-1P1D-8G:
       tool-call-parser: glm47
       reasoning-parser: glm47
       enable-auto-tool-choice: true
-
-
-# 2P1D 形态：每实例的 engine/env 与 GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G 完全一致，
-# 实例数只体现在 arch 名（2P1D）；总卡数 = 2x(1x2) + 1x4 = 8。
-# ⚠️ 部署脚本 vllm-native-arch-deploy.sh 目前只支持每角色单实例（1P1D），
-#    其 check_topology_and_log 遇到 2P1D 会直接 die，需先补多实例支持才能部署。
 GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
   description: >-
     GLM-5.3 NVFP4/W4A4C8（compressed-tensors：NVFP4 4bit + 部分层 FP8 8bit）在单机
@@ -361,7 +355,7 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D-6G:
       reasoning-parser: glm47
       enable-auto-tool-choice: true
 
-GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
+GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G:
   description: >-
     GLM-5.3 NVIDIA 原生 NVFP4 在单机 8×H800 上：1 个 Prefill 实例（TP1 x PP2，
     :8010）+ 1 个 Decode 实例（TP1 x DP4，:8020），KV 经 MooncakeConnector 走
@@ -379,7 +373,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8010
       tensor-parallel-size: 1
@@ -418,7 +412,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8020
       tensor-parallel-size: 1
@@ -454,7 +448,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       VLLM_PP_LAYER_PARTITION: "22,20,20,16"
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8000
       tensor-parallel-size: 1
@@ -818,10 +812,8 @@ GLM-5.2-NVFP4-W4A4C8-MG40-BNT3-1P1D-8G:
       enable-auto-tool-choice: true
 
 
-# 2P1D 形态：每实例的 engine/env 与 GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G 完全一致，
+# 2P1D 形态：每实例的 engine/env 与 GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G 完全一致，
 # 实例数只体现在 arch 名（2P1D）；总卡数 = 2x(1x2) + 1x4 = 8。
-# ⚠️ 部署脚本 vllm-native-arch-deploy.sh 目前只支持每角色单实例（1P1D），
-#    其 check_topology_and_log 遇到 2P1D 会直接 die，需先补多实例支持才能部署。
 GLM-5.3-NVFP4-NVIDIA-BNT3-2P1D-8G:
   description: >-
     GLM-5.3 NVIDIA 原生 NVFP4 在单机 8×H800 上：2 个 Prefill 实例（各 TP1 x PP2，
