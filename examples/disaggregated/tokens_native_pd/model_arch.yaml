@@ -13,85 +13,107 @@
 #   vllm serve --config <(render_serve_config.py <arch_name> prefill)
 #   eval "$(render_serve_config.py <arch_name> prefill --env)"
 
-GLM-5.2-W4A4C8-MG40-BNT3-1P1D:
+GLM-5.2-W4A4C8-MG40-PP4-1P1D-8G:
   description: >-
-    GLM-5.2 NVFP4 (W4A4C8) on the MG40-BNT3 platform: 1 Prefill pod
-    (TP1 x PP4) + 1 Decode pod (TP1 x DP4 over Ray), KV transfer over
-    MooncakeConnector, Mooncake proxy exposing :8000.
+    GLM-5.2 NVFP4/W4A4C8 在单机 8×H800 上：1 个 Prefill 实例（TP1 x PP4，:8010）+
+    1 个 Decode 实例（TP1 x DP4，:8020），合计 8 卡，KV 经 MooncakeConnector 走
+    RDMA(RoCE) 传输；由 vllm-router 对外提供 :8000。本策略不写死权重路径
+    （engine 不含 model），部署时由部署层注入（MODEL_DIR）或以 --model 指定。
   prefill:
     env:
-      VLLM_PLUGINS: ""
-      # One entry per pipeline-parallel-size rank.
+      # 78 层按 PP4 切分 "22,20,20,16"（不指定时 vLLM 默认 19/20/20/19；尾段少分，
+      # 因末尾 rank 额外背 lm_head）
       VLLM_PP_LAYER_PARTITION: "22,20,20,16"
-      XCCL_TURBO_PREFILL_MLA_HEAD_PADDING: "64"
       VLLM_MOONCAKE_BOOTSTRAP_PORT: "8998"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+      # v2 model runner（vLLM env 开关，与 decode 侧一致）
+      VLLM_USE_V2_MODEL_RUNNER: "1"
     engine:
-      model: /home/service/works/models_ssd/GLM-5.2-NVFP4-W4A4C8-MG40-BNT3/v1
-      served-model-name: GLM-5.2-NVFP4-W4A4C8-MG40-BNT3
+      served-model-name: GLM-5.2-W4A4C8-MG40-PP4-1P1D-8G
       host: 0.0.0.0
       port: 8010
       tensor-parallel-size: 1
       pipeline-parallel-size: 4
       distributed-executor-backend: mp
-      # GLM-5.2 NVFP4 requires a uniform page size of 64 across PP ranks.
-      block-size: 64
-      max-model-len: 1048576
+      max-model-len: 524288
       max-num-seqs: 8
-      max-num-batched-tokens: 32768
-      gpu-memory-utilization: 0.90
-      enable-prefix-caching: true
+      max-num-batched-tokens: 4096
+      gpu-memory-utilization: 0.9
+      enable-prefix-caching: false
       kv-cache-dtype: fp8
-      speculative-config:
-        method: mtp
-        num_speculative_tokens: 3
-      compilation-config:
-        cudagraph_mode: NONE
+      enable-expert-parallel: false
+      # P 侧开 enforce-eager：跳过 CUDA graph 捕获/编译
+      enforce-eager: true
+      async-scheduling: false
+      # P 侧不启用 MTP（关闭方式 = 不写 speculative-config）：
+      #   vLLM 0.29 —— 配置校验期直接拒绝（NotImplementedError: Pipeline parallelism
+      #               is not supported for this model）
+      #   vLLM 0.31 —— 配置/权重/CUDA 图都过，但 PP warmup 阶段死锁（4 个 PP rank
+      #               注册 KV 后卡在 PP 组 broadcast 的 P2P 链，GPU 空闲；实测）
+      #   vLLM 0.30 —— 该组合可用（P mtp1 + PP4 已跑通 1174 请求）
+      # 注：num_speculative_tokens: 0 不被接受（SpeculativeConfig pydantic 校验失败），
+      #     故用"省略该键"表达关闭；确认支持的版本要开就把下面三行加回：
+      # speculative-config:
+      #   method: mtp
+      #   num_speculative_tokens: 1
+      # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
       kernel-config:
         enable_flashinfer_autotune: false
       kv-transfer-config:
         kv_connector: MooncakeConnector
         kv_role: kv_producer
+      tool-call-parser: glm47
+      reasoning-parser: glm45
+      enable-auto-tool-choice: true
   decode:
     env:
-      VLLM_PLUGINS: ""
-      RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES: "1"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
+      # v2 model runner / breakable cudagraph（vLLM env 开关，显式对齐平台参数）
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
     engine:
-      model: /home/service/works/models_ssd/GLM-5.2-NVFP4-W4A4C8-MG40-BNT3/v1
-      served-model-name: GLM-5.2-NVFP4-W4A4C8-MG40-BNT3
+      served-model-name: GLM-5.2-W4A4C8-MG40-PP4-1P1D-8G
       host: 0.0.0.0
       port: 8020
       tensor-parallel-size: 1
       data-parallel-size: 4
+      # DP 走 Ray（backend=ray 时 data_parallel_size_local 默认等于 dp size）
       data-parallel-backend: ray
       distributed-executor-backend: mp
-      block-size: 64
       max-model-len: 1048576
       max-num-seqs: 32
       max-num-batched-tokens: 128
       gpu-memory-utilization: 0.94
-      enable-prefix-caching: true
+      enable-prefix-caching: false
       kv-cache-dtype: fp8
+      enable-expert-parallel: false
       async-scheduling: true
+      # MTP：decode 侧用 3 个 draft token
       speculative-config:
         method: mtp
         num_speculative_tokens: 3
       compilation-config:
-        cudagraph_mode: NONE
+        cudagraph_mode: FULL_DECODE_ONLY
+        cudagraph_capture_sizes: [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]
       kernel-config:
-        enable_flashinfer_autotune: false
+        enable_flashinfer_autotune: true
       kv-transfer-config:
         kv_connector: MooncakeConnector
         kv_role: kv_consumer
-  # DEPLOY_MODE=standalone baseline: Prefill-shaped single instance serving
-  # directly, without Mooncake / P/D disaggregation.
+      tool-call-parser: glm47
+      reasoning-parser: glm45
+      enable-auto-tool-choice: true
+  # 非 P/D 基线：单个 Prefill 形态实例直服（对照/排障用）
   standalone:
     env:
-      VLLM_PLUGINS: ""
       VLLM_PP_LAYER_PARTITION: "22,20,20,16"
-      XCCL_TURBO_PREFILL_MLA_HEAD_PADDING: "64"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     engine:
-      model: /home/service/works/models_ssd/GLM-5.2-NVFP4-W4A4C8-MG40-BNT3/v1
-      served-model-name: GLM-5.2-NVFP4-W4A4C8-MG40-BNT3
+      served-model-name: GLM-5.2-W4A4C8-MG40-PP4-1P1D-8G
       host: 0.0.0.0
       port: 8000
       tensor-parallel-size: 1
@@ -99,19 +121,18 @@ GLM-5.2-W4A4C8-MG40-BNT3-1P1D:
       distributed-executor-backend: mp
       block-size: 64
       max-model-len: 1048576
-      max-num-seqs: 8
-      max-num-batched-tokens: 32768
-      gpu-memory-utilization: 0.90
+      gpu-memory-utilization: 0.9
       enable-prefix-caching: true
       kv-cache-dtype: fp8
+      # MTP：standalone 按 decode 口径开 3
       speculative-config:
         method: mtp
         num_speculative_tokens: 3
-      compilation-config:
-        cudagraph_mode: NONE
       kernel-config:
         enable_flashinfer_autotune: false
-
+      tool-call-parser: glm47
+      reasoning-parser: glm47
+      enable-auto-tool-choice: true
 GLM-5.3-W4A4C8-MG42-BNT3-1P1D:
   description: >-
     GLM-5.3 NVFP4/W4A4C8（compressed-tensors：NVFP4 4bit + 部分层 FP8 8bit）在单机
@@ -336,7 +357,7 @@ GLM-5.3-W4A4C8-MG42-BNT3-1P1D-6G:
       reasoning-parser: glm47
       enable-auto-tool-choice: true
 
-GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
+GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G:
   description: >-
     GLM-5.3 NVIDIA 原生 NVFP4 在单机 8×H800 上：1 个 Prefill 实例（TP1 x PP2，
     :8010）+ 1 个 Decode 实例（TP1 x DP4，:8020），KV 经 MooncakeConnector 走
@@ -354,7 +375,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       # router 复用连接的空闲间隔可能远超镜像默认的 5s（router 写请求体时会撞 Broken pipe）
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8010
       tensor-parallel-size: 1
@@ -393,7 +414,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       # 同 prefill：调长 keep-alive，避免 router 写请求体撞上服务端已关闭的空闲连接
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "75"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8020
       tensor-parallel-size: 1
@@ -429,7 +450,7 @@ GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G:
       VLLM_PP_LAYER_PARTITION: "22,20,20,16"
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     engine:
-      served-model-name: GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G
+      served-model-name: GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G
       host: 0.0.0.0
       port: 8000
       tensor-parallel-size: 1
@@ -793,10 +814,8 @@ GLM-5.2-NVFP4-W4A4C8-MG40-BNT3-1P1D-8G:
       enable-auto-tool-choice: true
 
 
-# 2P1D 形态：每实例的 engine/env 与 GLM-5.3-NVFP4-NVIDIA-BNT3-1P1D-6G 完全一致，
+# 2P1D 形态：每实例的 engine/env 与 GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G 完全一致，
 # 实例数只体现在 arch 名（2P1D）；总卡数 = 2x(1x2) + 1x4 = 8。
-# ⚠️ 部署脚本 vllm-native-arch-deploy.sh 目前只支持每角色单实例（1P1D），
-#    其 check_topology_and_log 遇到 2P1D 会直接 die，需先补多实例支持才能部署。
 GLM-5.3-NVFP4-NVIDIA-BNT3-2P1D-8G:
   description: >-
     GLM-5.3 NVIDIA 原生 NVFP4 在单机 8×H800 上：2 个 Prefill 实例（各 TP1 x PP2，
