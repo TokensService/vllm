@@ -383,6 +383,8 @@ GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G:
       distributed-executor-backend: mp
       # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
       block-size: 64
+      # PP2 下每 rank 权重占比大，0.94 下 KV 约 21GiB；不设则取默认 1M 会超预算启动失败
+      max-model-len: 900000
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
