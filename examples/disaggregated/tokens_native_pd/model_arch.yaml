@@ -35,12 +35,8 @@ GLM-5.3-W4A4C8-MG46-BNT3-2P1D-8G:
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
       kv-cache-dtype: fp8
-      # MTP：P 侧开 1 个 draft token。PP 组合的版本下限：0.29 校验期报
-      # NotImplementedError（PP 不支持），0.31 PP warmup 死锁，0.30 可用
-      # （P mtp1 + PP4 已跑通 1174 请求）；换镜像前先确认
-      speculative-config:
-        method: mtp
-        num_speculative_tokens: 1
+      # P 侧不开 MTP（省略 speculative-config 即关闭；num_speculative_tokens: 0 不被接受）：
+      # PP 组合下 0.29 校验期报 NotImplementedError、0.31 PP warmup 死锁
       # 先保证最快拉起：关掉 flashinfer autotune（性能调优阶段再打开）
       kernel-config:
         enable_flashinfer_autotune: false
