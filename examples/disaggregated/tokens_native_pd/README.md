@@ -9,16 +9,20 @@ a single file, `model_arch.yaml`, keyed by `arch_name`.
 <model>-<quant>-<platform>-<topology>
 ```
 
-e.g. `GLM-5.2-W4A4C8-EMS-3P1D` = GLM-5.2 model, W4A4C8 quantization, EMS
-platform, 3 Prefill + 1 Decode instances. The topology suffix is `<n>P<m>D`
+e.g. `GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G` = GLM-5.3 model, NVFP4 quantization,
+NVIDIA platform, 1 Prefill + 1 Decode instance. The topology suffix is `<n>P<m>D`
 for disaggregated strategies, `<n>P` for standalone-only ones.
 
 Currently registered:
 
-- `GLM-5.2-W4A4C8-MG40-BNT3-1P1D` — GLM-5.2 NVFP4 on MG40-BNT3: 1 Prefill
-  pod (TP1 x PP4, :8010) + 1 Decode pod (TP1 x DP4 over Ray, :8020), KV
-  transfer over MooncakeConnector, plus a `standalone` single-instance
+- `GLM-5.3-W4A4C8-MG46-BNT3-2P1D-8G` — GLM-5.3 W4A4C8 (NVFP4 + FP8) on
+  MG46-BNT3: 2 Prefill pods (TP1 x PP2, ports from :8010, assigned by the
+  deploy layer) + 1 Decode pod (TP1 x DP4 over Ray, :8020), 8 GPUs in total,
+  KV transfer over MooncakeConnector, plus a `standalone` single-instance
   baseline mode (:8000).
+- `GLM-5.3-NVFP4-NVIDIA-*` — GLM-5.3 native NVFP4, several GPU budgets/topologies:
+  `PP2-1P1D-6G`, `BNT3-1P1D-8G` (P TP1 x DP4), `BNT3-2P1D-8G` (two Prefills),
+  `BNT3-1P1D-PP4-8G` (P TP1 x PP4).
 
 ## Strategy layout
 
@@ -37,16 +41,16 @@ shell exports:
 
 ```bash
 # Prefill (PD mode)
-eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D prefill --env)"
-vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D prefill)
+eval "$(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G prefill --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G prefill)
 
 # Decode (PD mode)
-eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D decode --env)"
-vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D decode)
+eval "$(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G decode --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G decode)
 
 # Standalone baseline
-eval "$(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D standalone --env)"
-vllm serve --config <(./render_serve_config.py GLM-5.2-W4A4C8-MG40-BNT3-1P1D standalone)
+eval "$(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G standalone --env)"
+vllm serve --config <(./render_serve_config.py GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G standalone)
 ```
 
 ## What is intentionally not in model_arch.yaml

@@ -27,7 +27,7 @@ def load_role(path: Path, arch_name: str, role: str) -> dict:
 
     Args:
         path: Path to model_arch.yaml.
-        arch_name: Strategy key, e.g. GLM-5.2-W4A4C8-MG40-BNT3-1P1D.
+        arch_name: Strategy key, e.g. GLM-5.3-NVFP4-NVIDIA-PP2-1P1D-6G.
         role: One of prefill / decode / standalone.
 
     Returns:
