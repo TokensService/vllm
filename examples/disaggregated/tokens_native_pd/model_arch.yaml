@@ -31,9 +31,10 @@ GLM-5.3-W4A4C8-MG46-BNT3-2P1D-8G:
       distributed-executor-backend: mp
       # GLM-5.3 的 DSA 稀疏注意力要求 PP 各 rank 页大小统一为 64
       block-size: 64
+      max-model-len: 524288
       gpu-memory-utilization: 0.94
       enable-prefix-caching: true
-      kv-cache-dtype: nvfp4_ds_mla
+      kv-cache-dtype: fp8
       # MTP：P 侧开 1 个 draft token。PP 组合的版本下限：0.29 校验期报
       # NotImplementedError（PP 不支持），0.31 PP warmup 死锁，0.30 可用
       # （P mtp1 + PP4 已跑通 1174 请求）；换镜像前先确认
