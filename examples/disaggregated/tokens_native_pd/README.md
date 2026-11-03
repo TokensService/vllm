@@ -20,6 +20,9 @@ Currently registered:
   deploy layer) + 1 Decode pod (TP1 x DP4 over Ray, :8020), 8 GPUs in total,
   KV transfer over MooncakeConnector, plus a `standalone` single-instance
   baseline mode (:8000).
+- `GLM-5.3-W4A4C8-MG46-BNT3-1P1D-8G` — same weights/knobs as above but one
+  Prefill pod with TP1 x PP4 (:8010) instead of two TP1 x PP2 pods; decode,
+  standalone and total GPU count (8) are identical.
 - `GLM-5.3-NVFP4-NVIDIA-*` — GLM-5.3 native NVFP4, several GPU budgets/topologies:
   `PP2-1P1D-6G`, `BNT3-1P1D-8G` (P TP1 x DP4), `BNT3-2P1D-8G` (two Prefills),
   `BNT3-1P1D-PP4-8G` (P TP1 x PP4).
